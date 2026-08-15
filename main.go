@@ -151,12 +151,15 @@ func run(o Opts) (Result, error) {
 		},
 		&container.HostConfig{
 			NetworkMode:    "none",
-			AutoRemove:     false, // we remove manually in the deferred cleanup
+			AutoRemove:     false,
 			ReadonlyRootfs: true,
 			CapDrop:        []string{"ALL"},
 			SecurityOpt:    []string{"no-new-privileges"},
 			Binds:          o.Binds,
-			Tmpfs:          map[string]string{"/work": "rw,size=64m", "/tmp": "rw,size=16m"},
+			Tmpfs: map[string]string{
+				"/work": "rw,size=64m,mode=1777",
+				"/tmp":  "rw,size=16m,mode=1777",
+			},
 			Resources: container.Resources{
 				Memory:    o.MemMB * 1024 * 1024,
 				NanoCPUs:  int64(o.CPUs * 1e9),
