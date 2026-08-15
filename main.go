@@ -11,9 +11,12 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	imagetypes "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 )
+
+func imagePullOptions() imagetypes.PullOptions { return imagetypes.PullOptions{} }
 
 func main() {
 	if len(os.Args) < 2 || os.Args[1] != "run" {
@@ -68,6 +71,7 @@ func run(image string, cmd []string, timeout time.Duration, memMB int64) (int, e
 		&container.HostConfig{
 			AutoRemove:     false, // we remove manually so we can fetch logs first
 			ReadonlyRootfs: true,
+			NetworkMode:    "none",
 			CapDrop:        []string{"ALL"},
 			SecurityOpt:    []string{"no-new-privileges"},
 			Tmpfs:          map[string]string{"/work": "rw,size=64m", "/tmp": "rw,size=16m"},
