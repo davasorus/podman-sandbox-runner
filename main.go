@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -18,6 +20,16 @@ import (
 
 func imagePullOptions() imagetypes.PullOptions { return imagetypes.PullOptions{} }
 
+type Result struct {
+	ExitCode   int    `json:"exit_code"`
+	Stdout     string `json:"stdout"`
+	Stderr     string `json:"stderr"`
+	DurationMS int64  `json:"duration_ms"`
+	OOMKilled  bool   `json:"oom_killed"`
+	TimedOut   bool   `json:"timed_out"`
+	Error      string `json:"error,omitempty"`
+}
+
 func main() {
 	if len(os.Args) < 2 || os.Args[1] != "run" {
 		fmt.Fprintln(os.Stderr, "usage: sandbox run [flags] -- <command...>")
@@ -29,6 +41,7 @@ func main() {
 	timeout := fs.Duration("timeout", 30*time.Second, "hard execution timeout")
 	mem := fs.Int64("mem", 256, "memory limit in MB")
 	stdinFlag := fs.Bool("i", false, "pipe stdin into the container")
+	jsonFlag := fs.Bool("json", false, "emit result as JSON instead of streaming")
 	fs.Parse(os.Args[2:])
 
 	cmd := fs.Args()
@@ -37,22 +50,36 @@ func main() {
 		os.Exit(2)
 	}
 
-	exitCode, err := run(*image, cmd, *timeout, *mem, *stdinFlag)
+	res, err := run(*image, cmd, *timeout, *mem, *stdinFlag, *jsonFlag)
+
+	if *jsonFlag {
+		if err != nil {
+			res.Error = err.Error()
+		}
+		json.NewEncoder(os.Stdout).Encode(res)
+		if err != nil {
+			os.Exit(125)
+		}
+		os.Exit(0) // container exit code lives in the JSON
+	}
+
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "sandbox:", err)
 		os.Exit(125)
 	}
-	os.Exit(exitCode)
+	os.Exit(res.ExitCode)
 }
 
-func run(image string, cmd []string, timeout time.Duration, memMB int64, withStdin bool) (int, error) {
+func run(image string, cmd []string, timeout time.Duration, memMB int64, withStdin, jsonMode bool) (Result, error) {
+	var res Result
+
 	// ctrl-C cancels everything; cleanup still runs
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		return 0, fmt.Errorf("connecting to socket: %w", err)
+		return res, fmt.Errorf("connecting to socket: %w", err)
 	}
 	defer cli.Close()
 
@@ -87,7 +114,7 @@ func run(image string, cmd []string, timeout time.Duration, memMB int64, withStd
 		},
 		nil, nil, "")
 	if err != nil {
-		return 0, fmt.Errorf("create: %w", err)
+		return res, fmt.Errorf("create: %w", err)
 	}
 	id := resp.ID
 
@@ -106,14 +133,20 @@ func run(image string, cmd []string, timeout time.Duration, memMB int64, withStd
 		Stdin:  withStdin,
 	})
 	if err != nil {
-		return 0, fmt.Errorf("attach: %w", err)
+		return res, fmt.Errorf("attach: %w", err)
 	}
 	defer att.Close()
 
-	// demux and stream output live
+	// output goes to the terminal, or into buffers in JSON mode
+	var stdoutBuf, stderrBuf bytes.Buffer
+	outW, errW := io.Writer(os.Stdout), io.Writer(os.Stderr)
+	if jsonMode {
+		outW, errW = &stdoutBuf, &stderrBuf
+	}
+
 	outDone := make(chan error, 1)
 	go func() {
-		_, err := stdcopy.StdCopy(os.Stdout, os.Stderr, att.Reader)
+		_, err := stdcopy.StdCopy(outW, errW, att.Reader)
 		outDone <- err
 	}()
 
@@ -125,8 +158,10 @@ func run(image string, cmd []string, timeout time.Duration, memMB int64, withStd
 		}()
 	}
 
+	started := time.Now()
+
 	if err := cli.ContainerStart(ctx, id, container.StartOptions{}); err != nil {
-		return 0, fmt.Errorf("start: %w", err)
+		return res, fmt.Errorf("start: %w", err)
 	}
 
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -134,24 +169,34 @@ func run(image string, cmd []string, timeout time.Duration, memMB int64, withStd
 
 	waitCh, errCh := cli.ContainerWait(runCtx, id, container.WaitConditionNotRunning)
 
-	var exitCode int
 	select {
 	case w := <-waitCh:
-		exitCode = int(w.StatusCode)
+		res.ExitCode = int(w.StatusCode)
 	case err := <-errCh:
 		if runCtx.Err() != nil {
-			return 0, fmt.Errorf("timed out after %s (container killed)", timeout)
+			res.TimedOut = true
+			res.DurationMS = time.Since(started).Milliseconds()
+			res.Stdout, res.Stderr = stdoutBuf.String(), stderrBuf.String()
+			return res, fmt.Errorf("timed out after %s (container killed)", timeout)
 		}
-		return 0, fmt.Errorf("wait: %w", err)
+		return res, fmt.Errorf("wait: %w", err)
 	}
 
-	// drain remaining buffered output before returning
+	res.DurationMS = time.Since(started).Milliseconds()
+
+	// drain remaining buffered output
 	select {
 	case <-outDone:
 	case <-time.After(2 * time.Second):
 	}
+	res.Stdout, res.Stderr = stdoutBuf.String(), stderrBuf.String()
 
-	return exitCode, nil
+	// OOM flag from inspect
+	if insp, err := cli.ContainerInspect(context.Background(), id); err == nil && insp.State != nil {
+		res.OOMKilled = insp.State.OOMKilled
+	}
+
+	return res, nil
 }
 
 func ptr[T any](v T) *T { return &v }
