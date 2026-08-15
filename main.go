@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -30,6 +31,26 @@ type Result struct {
 	Error      string `json:"error,omitempty"`
 }
 
+type Opts struct {
+	Image     string
+	Cmd       []string
+	Timeout   time.Duration
+	MemMB     int64
+	CPUs      float64
+	User      string
+	Binds     []string
+	WithStdin bool
+	JSONMode  bool
+}
+
+type multiFlag []string
+
+func (m *multiFlag) String() string { return strings.Join(*m, ",") }
+func (m *multiFlag) Set(v string) error {
+	*m = append(*m, v)
+	return nil
+}
+
 func main() {
 	if len(os.Args) < 2 || os.Args[1] != "run" {
 		fmt.Fprintln(os.Stderr, "usage: sandbox run [flags] -- <command...>")
@@ -40,8 +61,12 @@ func main() {
 	image := fs.String("image", "docker.io/library/alpine:latest", "container image")
 	timeout := fs.Duration("timeout", 30*time.Second, "hard execution timeout")
 	mem := fs.Int64("mem", 256, "memory limit in MB")
+	cpus := fs.Float64("cpus", 1.0, "CPU limit (cores)")
+	user := fs.String("user", "65534:65534", "run as user (uid:gid); empty = image default")
 	stdinFlag := fs.Bool("i", false, "pipe stdin into the container")
 	jsonFlag := fs.Bool("json", false, "emit result as JSON instead of streaming")
+	var vols multiFlag
+	fs.Var(&vols, "v", "mount host file/dir read-only: /host/path:/container/path (repeatable)")
 	fs.Parse(os.Args[2:])
 
 	cmd := fs.Args()
@@ -50,9 +75,32 @@ func main() {
 		os.Exit(2)
 	}
 
-	res, err := run(*image, cmd, *timeout, *mem, *stdinFlag, *jsonFlag)
+	// normalize mounts: absolute paths required, read-only enforced
+	binds := make([]string, 0, len(vols))
+	for _, v := range vols {
+		parts := strings.SplitN(v, ":", 3)
+		if len(parts) < 2 || !strings.HasPrefix(parts[0], "/") || !strings.HasPrefix(parts[1], "/") {
+			fmt.Fprintf(os.Stderr, "bad -v %q: want /abs/host/path:/abs/container/path\n", v)
+			os.Exit(2)
+		}
+		binds = append(binds, parts[0]+":"+parts[1]+":ro")
+	}
 
-	if *jsonFlag {
+	o := Opts{
+		Image:     *image,
+		Cmd:       cmd,
+		Timeout:   *timeout,
+		MemMB:     *mem,
+		CPUs:      *cpus,
+		User:      *user,
+		Binds:     binds,
+		WithStdin: *stdinFlag,
+		JSONMode:  *jsonFlag,
+	}
+
+	res, err := run(o)
+
+	if o.JSONMode {
 		if err != nil {
 			res.Error = err.Error()
 		}
@@ -70,7 +118,7 @@ func main() {
 	os.Exit(res.ExitCode)
 }
 
-func run(image string, cmd []string, timeout time.Duration, memMB int64, withStdin, jsonMode bool) (Result, error) {
+func run(o Opts) (Result, error) {
 	var res Result
 
 	// ctrl-C cancels everything; cleanup still runs
@@ -84,21 +132,22 @@ func run(image string, cmd []string, timeout time.Duration, memMB int64, withStd
 	defer cli.Close()
 
 	// pull if not present; errors deliberately ignored so local-only images still work
-	if rc, err := cli.ImagePull(ctx, image, imagePullOptions()); err == nil {
+	if rc, err := cli.ImagePull(ctx, o.Image, imagePullOptions()); err == nil {
 		io.Copy(io.Discard, rc)
 		rc.Close()
 	}
 
 	resp, err := cli.ContainerCreate(ctx,
 		&container.Config{
-			Image:        image,
-			Cmd:          cmd,
+			Image:        o.Image,
+			Cmd:          o.Cmd,
+			User:         o.User,
 			WorkingDir:   "/work",
 			AttachStdout: true,
 			AttachStderr: true,
-			AttachStdin:  withStdin,
-			OpenStdin:    withStdin,
-			StdinOnce:    withStdin, // close container stdin when ours ends
+			AttachStdin:  o.WithStdin,
+			OpenStdin:    o.WithStdin,
+			StdinOnce:    o.WithStdin, // close container stdin when ours ends
 		},
 		&container.HostConfig{
 			NetworkMode:    "none",
@@ -106,9 +155,11 @@ func run(image string, cmd []string, timeout time.Duration, memMB int64, withStd
 			ReadonlyRootfs: true,
 			CapDrop:        []string{"ALL"},
 			SecurityOpt:    []string{"no-new-privileges"},
+			Binds:          o.Binds,
 			Tmpfs:          map[string]string{"/work": "rw,size=64m", "/tmp": "rw,size=16m"},
 			Resources: container.Resources{
-				Memory:    memMB * 1024 * 1024,
+				Memory:    o.MemMB * 1024 * 1024,
+				NanoCPUs:  int64(o.CPUs * 1e9),
 				PidsLimit: ptr(int64(128)),
 			},
 		},
@@ -130,7 +181,7 @@ func run(image string, cmd []string, timeout time.Duration, memMB int64, withStd
 		Stream: true,
 		Stdout: true,
 		Stderr: true,
-		Stdin:  withStdin,
+		Stdin:  o.WithStdin,
 	})
 	if err != nil {
 		return res, fmt.Errorf("attach: %w", err)
@@ -140,7 +191,7 @@ func run(image string, cmd []string, timeout time.Duration, memMB int64, withStd
 	// output goes to the terminal, or into buffers in JSON mode
 	var stdoutBuf, stderrBuf bytes.Buffer
 	outW, errW := io.Writer(os.Stdout), io.Writer(os.Stderr)
-	if jsonMode {
+	if o.JSONMode {
 		outW, errW = &stdoutBuf, &stderrBuf
 	}
 
@@ -151,7 +202,7 @@ func run(image string, cmd []string, timeout time.Duration, memMB int64, withStd
 	}()
 
 	// pump stdin if requested
-	if withStdin {
+	if o.WithStdin {
 		go func() {
 			io.Copy(att.Conn, os.Stdin)
 			att.CloseWrite() // signal EOF to the container
@@ -164,7 +215,7 @@ func run(image string, cmd []string, timeout time.Duration, memMB int64, withStd
 		return res, fmt.Errorf("start: %w", err)
 	}
 
-	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	runCtx, cancel := context.WithTimeout(ctx, o.Timeout)
 	defer cancel()
 
 	waitCh, errCh := cli.ContainerWait(runCtx, id, container.WaitConditionNotRunning)
@@ -177,7 +228,7 @@ func run(image string, cmd []string, timeout time.Duration, memMB int64, withStd
 			res.TimedOut = true
 			res.DurationMS = time.Since(started).Milliseconds()
 			res.Stdout, res.Stderr = stdoutBuf.String(), stderrBuf.String()
-			return res, fmt.Errorf("timed out after %s (container killed)", timeout)
+			return res, fmt.Errorf("timed out after %s (container killed)", o.Timeout)
 		}
 		return res, fmt.Errorf("wait: %w", err)
 	}
