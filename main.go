@@ -28,6 +28,7 @@ func main() {
 	image := fs.String("image", "docker.io/library/alpine:latest", "container image")
 	timeout := fs.Duration("timeout", 30*time.Second, "hard execution timeout")
 	mem := fs.Int64("mem", 256, "memory limit in MB")
+	stdinFlag := fs.Bool("i", false, "pipe stdin into the container")
 	fs.Parse(os.Args[2:])
 
 	cmd := fs.Args()
@@ -36,7 +37,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	exitCode, err := run(*image, cmd, *timeout, *mem)
+	exitCode, err := run(*image, cmd, *timeout, *mem, *stdinFlag)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "sandbox:", err)
 		os.Exit(125)
@@ -44,7 +45,7 @@ func main() {
 	os.Exit(exitCode)
 }
 
-func run(image string, cmd []string, timeout time.Duration, memMB int64) (int, error) {
+func run(image string, cmd []string, timeout time.Duration, memMB int64, withStdin bool) (int, error) {
 	// ctrl-C cancels everything; cleanup still runs
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -55,23 +56,27 @@ func run(image string, cmd []string, timeout time.Duration, memMB int64) (int, e
 	}
 	defer cli.Close()
 
-	// pull if not present (idempotent)
+	// pull if not present; errors deliberately ignored so local-only images still work
 	if rc, err := cli.ImagePull(ctx, image, imagePullOptions()); err == nil {
 		io.Copy(io.Discard, rc)
 		rc.Close()
-	} // pull errors deliberately ignored: local-only images (no registry) still work
+	}
 
 	resp, err := cli.ContainerCreate(ctx,
 		&container.Config{
-			Image:           image,
-			Cmd:             cmd,
-			NetworkDisabled: true,
-			WorkingDir:      "/work",
+			Image:        image,
+			Cmd:          cmd,
+			WorkingDir:   "/work",
+			AttachStdout: true,
+			AttachStderr: true,
+			AttachStdin:  withStdin,
+			OpenStdin:    withStdin,
+			StdinOnce:    withStdin, // close container stdin when ours ends
 		},
 		&container.HostConfig{
-			AutoRemove:     false, // we remove manually so we can fetch logs first
-			ReadonlyRootfs: true,
 			NetworkMode:    "none",
+			AutoRemove:     false, // we remove manually in the deferred cleanup
+			ReadonlyRootfs: true,
 			CapDrop:        []string{"ALL"},
 			SecurityOpt:    []string{"no-new-privileges"},
 			Tmpfs:          map[string]string{"/work": "rw,size=64m", "/tmp": "rw,size=16m"},
@@ -86,12 +91,39 @@ func run(image string, cmd []string, timeout time.Duration, memMB int64) (int, e
 	}
 	id := resp.ID
 
-	// cleanup runs no matter how we exit — use a fresh context since ctx may be dead
+	// cleanup runs no matter how we exit — fresh context since ctx may be dead
 	defer func() {
 		rmCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		cli.ContainerRemove(rmCtx, id, container.RemoveOptions{Force: true})
 	}()
+
+	// attach before start so no output is missed
+	att, err := cli.ContainerAttach(ctx, id, container.AttachOptions{
+		Stream: true,
+		Stdout: true,
+		Stderr: true,
+		Stdin:  withStdin,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("attach: %w", err)
+	}
+	defer att.Close()
+
+	// demux and stream output live
+	outDone := make(chan error, 1)
+	go func() {
+		_, err := stdcopy.StdCopy(os.Stdout, os.Stderr, att.Reader)
+		outDone <- err
+	}()
+
+	// pump stdin if requested
+	if withStdin {
+		go func() {
+			io.Copy(att.Conn, os.Stdin)
+			att.CloseWrite() // signal EOF to the container
+		}()
+	}
 
 	if err := cli.ContainerStart(ctx, id, container.StartOptions{}); err != nil {
 		return 0, fmt.Errorf("start: %w", err)
@@ -108,25 +140,18 @@ func run(image string, cmd []string, timeout time.Duration, memMB int64) (int, e
 		exitCode = int(w.StatusCode)
 	case err := <-errCh:
 		if runCtx.Err() != nil {
-			dumpLogs(cli, id)
 			return 0, fmt.Errorf("timed out after %s (container killed)", timeout)
 		}
 		return 0, fmt.Errorf("wait: %w", err)
 	}
 
-	dumpLogs(cli, id)
-	return exitCode, nil
-}
-
-func dumpLogs(cli *client.Client, id string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	rc, err := cli.ContainerLogs(ctx, id, container.LogsOptions{ShowStdout: true, ShowStderr: true})
-	if err != nil {
-		return
+	// drain remaining buffered output before returning
+	select {
+	case <-outDone:
+	case <-time.After(2 * time.Second):
 	}
-	defer rc.Close()
-	stdcopy.StdCopy(os.Stdout, os.Stderr, rc) // demux the multiplexed stream
+
+	return exitCode, nil
 }
 
 func ptr[T any](v T) *T { return &v }
