@@ -32,6 +32,9 @@ func main() {
 		fmt.Println("sandbox", version)
 		return
 	}
+	if len(os.Args) >= 2 && os.Args[1] == "bench" {
+		os.Exit(runBench(os.Args[2:]))
+	}
 	if len(os.Args) >= 2 && os.Args[1] == "serve" {
 		os.Exit(runServe(os.Args[2:]))
 	}
