@@ -4,6 +4,9 @@ updates:
     directory: /
     schedule:
       interval: daily
+    commit-message:
+      prefix: "chore" # Prefixed commit message for NuGet updates
+      include: "scope"
     groups:
       go-deps:
         patterns: ["*"]
@@ -12,3 +15,14 @@ updates:
     directory: /
     schedule:
       interval: daily
+    commit-message:
+      prefix: "chore" # Prefixed commit message for NuGet updates
+      include: "scope"
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: daily
+    commit-message:
+      prefix: "chore" # Prefixed commit message for NuGet updates
+      include: "scope"
