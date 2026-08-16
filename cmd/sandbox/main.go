@@ -11,7 +11,6 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/davasorus/podman-sandbox-runner/pkg/sandbox"
 )
@@ -33,26 +32,19 @@ func main() {
 		fmt.Println("sandbox", version)
 		return
 	}
-
+	if len(os.Args) >= 2 && os.Args[1] == "serve" {
+		os.Exit(runServe(os.Args[2:]))
+	}
 	if len(os.Args) < 2 || os.Args[1] != "run" {
-		fmt.Fprintln(os.Stderr, "usage: sandbox run [flags] -- <command...> | sandbox version")
+		fmt.Fprintln(os.Stderr, "usage: sandbox run [flags] -- <command...> | sandbox serve [flags] | sandbox version")
 		os.Exit(2)
 	}
 
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	image := fs.String("image", "docker.io/library/alpine:latest", "container image")
-	timeout := fs.Duration("timeout", 30*time.Second, "hard execution timeout")
-	mem := fs.Int64("mem", 256, "memory limit in MB")
-	cpus := fs.Float64("cpus", 1.0, "CPU limit (cores)")
-	user := fs.String("user", "65534:65534", "run as user (uid:gid); empty = image default")
-	backend := fs.String("backend", "auto", "execution backend: auto|docker|k8s")
-	netwait := fs.Duration("netwait", 0, "k8s only: delay start so network policy is enforced first (e.g. 3s)")
+	sf := registerSandboxFlags(fs)
 	stdinFlag := fs.Bool("i", false, "pipe stdin into the container")
 	jsonFlag := fs.Bool("json", false, "emit result as JSON instead of streaming")
-	runtime := fs.String("runtime", "", "alternate OCI runtime (docker: e.g. runsc) or RuntimeClass (k8s)")
-	var vols, envs multiFlag
-	fs.Var(&vols, "v", "mount host file/dir read-only: /host/path:/container/path (repeatable)")
-	fs.Var(&envs, "env", "environment variable KEY=VAL (repeatable)")
+	via := fs.String("via", "", "submit to a running daemon instead of executing locally: unix:///path or http://host:port")
 	_ = fs.Parse(os.Args[2:])
 
 	cmd := fs.Args()
@@ -61,40 +53,20 @@ func main() {
 		os.Exit(2)
 	}
 
-	binds := make([]string, 0, len(vols))
-	for _, v := range vols {
-		parts := strings.SplitN(v, ":", 3)
-		if len(parts) < 2 || !strings.HasPrefix(parts[0], "/") || !strings.HasPrefix(parts[1], "/") {
-			fmt.Fprintf(os.Stderr, "bad -v %q: want /abs/host/path:/abs/container/path\n", v)
-			os.Exit(2)
-		}
-		binds = append(binds, parts[0]+":"+parts[1]+":ro")
-	}
-
-	for _, e := range envs {
-		if !strings.Contains(e, "=") {
-			fmt.Fprintf(os.Stderr, "bad -env %q: want KEY=VAL\n", e)
-			os.Exit(2)
-		}
-	}
-
-	o := sandbox.Opts{
-		Image:     *image,
-		Cmd:       cmd,
-		Timeout:   *timeout,
-		NetWait:   *netwait,
-		MemMB:     *mem,
-		CPUs:      *cpus,
-		User:      *user,
-		Binds:     binds,
-		Env:       envs,
-		WithStdin: *stdinFlag,
-		Backend:   *backend,
-		Runtime:   *runtime,
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// --- daemon-client path ---
+	if *via != "" {
+		os.Exit(runViaDaemon(ctx, *via, cmd, *stdinFlag, *jsonFlag))
+	}
+
+	// --- local execution path ---
+	o, err := sf.buildOpts(cmd, *stdinFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 
 	var stdin io.Reader
 	if o.WithStdin {
@@ -123,4 +95,50 @@ func main() {
 		os.Exit(125)
 	}
 	os.Exit(res.ExitCode)
+}
+
+// runViaDaemon submits the command to a daemon at endpoint and renders the
+// response the same way local run does. Returns the process exit code.
+func runViaDaemon(ctx context.Context, endpoint string, cmd []string, withStdin, asJSON bool) int {
+	req := sandbox.RunRequest{Cmd: cmd}
+	if withStdin {
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "sandbox: reading stdin:", err)
+			return 125
+		}
+		req.Stdin = data
+	}
+
+	resp, err := sandbox.Submit(ctx, endpoint, req)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sandbox:", err)
+		return 125
+	}
+
+	if asJSON {
+		out := sandbox.Result{
+			ExitCode:  resp.ExitCode,
+			Stdout:    string(resp.Stdout),
+			Stderr:    string(resp.Stderr),
+			TimedOut:  resp.TimedOut,
+			OOMKilled: resp.OOMKilled,
+			Error:     resp.Error,
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(out); err != nil {
+			fmt.Fprintln(os.Stderr, "sandbox: encoding result:", err)
+		}
+		if resp.Error != "" {
+			return 125
+		}
+		return 0
+	}
+
+	_, _ = os.Stdout.Write(resp.Stdout)
+	_, _ = os.Stderr.Write(resp.Stderr)
+	if resp.Error != "" {
+		fmt.Fprintln(os.Stderr, "sandbox:", resp.Error)
+		return 125
+	}
+	return resp.ExitCode
 }

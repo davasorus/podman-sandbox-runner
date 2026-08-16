@@ -131,6 +131,58 @@ workloads exec as `Opts.User`. If a workload kills the holder (e.g. a
 cgroup-wide OOM), the pool fails closed and reports itself unusable
 rather than silently respawning. Docker/podman backend only.
 
+## Daemon mode (`sandbox serve`)
+
+Warm pools live only inside one process, so per-invocation CLI runs can't
+share them. `sandbox serve` runs a long-lived daemon that holds an
+autoscaling pool and executes runs submitted over a unix socket and/or a
+loopback HTTP listener — giving CLI and other clients persistent warmth.
+
+```sh
+# start a daemon: 1 warm holder, up to 4 under load, close idle after 5m
+sandbox serve -unix /run/user/$UID/sandbox.sock -min 1 -max 4 -idle 5m
+
+# also expose loopback HTTP (for curl / tooling / the library client)
+sandbox serve -unix /run/user/$UID/sandbox.sock -http 127.0.0.1:8099
+```
+
+Submit work from the CLI with `run -via`:
+
+```sh
+sandbox run -via unix:///run/user/$UID/sandbox.sock -- python3 -c 'print(6*7)'
+sandbox run -via http://127.0.0.1:8099 -i -- cat < input.txt
+```
+
+Or over HTTP directly (`POST /run`, JSON body; stdout/stderr are
+base64-encoded in the JSON response):
+
+```sh
+curl -s -X POST http://127.0.0.1:8099/run -d '{"cmd":["echo","hi"]}'
+```
+
+Or from Go, via the library client:
+
+```go
+resp, err := sandbox.Submit(ctx, "unix:///run/user/1000/sandbox.sock",
+    sandbox.RunRequest{Cmd: []string{"echo", "hi"}})
+```
+
+Pool flags: `-min` (warm floor, 0 allows scale-to-zero), `-max` (ceiling),
+`-idle` (close idle holders after this; 0 = never). Sandbox flags
+(`-image`, `-mem`, `-cpus`, `-user`, `-runtime`, `-backend`, ...) apply to
+every run the daemon executes and are fixed for the daemon's lifetime.
+
+**Security:** the daemon executes untrusted commands on behalf of anyone
+who can reach its socket or port.
+
+- The **unix socket** is created mode 0600 (owner-only) — this is the
+  access control; keep it in a directory only you can reach.
+- The **HTTP listener has no authentication**. It binds loopback only;
+  `serve` refuses a non-loopback `-http` bind unless `-http-allow-remote`
+  is passed. Treat reachability of the HTTP port as equivalent to the
+  ability to run arbitrary sandboxed commands. There is no TLS — do not
+  expose it beyond localhost.
+
 ## Connection
 
 **docker/podman**: standard Docker client env vars.
