@@ -202,6 +202,48 @@ who can reach its socket or port.
   ability to run arbitrary sandboxed commands. There is no TLS — do not
   expose it beyond localhost.
 
+## Benchmarks
+
+Two ways to measure: `go test -bench` (idiomatic, CI-graphable) and
+`sandbox bench` (a live dashboard that probes what's available and
+measures only those cells).
+
+```sh
+# live dashboard — measures whatever backends/runtimes are present
+KUBECONFIG=/etc/rancher/k3s/k3s.yaml sandbox bench -n 5
+
+# idiomatic Go benchmarks (gated so they never run in an ordinary test)
+SANDBOX_BENCH=1 go test -run '^$' -bench . -benchtime 10x ./pkg/sandbox/
+```
+
+Indicative figures from one machine (Ryzen 9 3950X, WSL2; rootless podman
+4.9.3 for the docker backend, k3s for k8s). Single-run, not a contract —
+run `sandbox bench` on your own host for numbers that matter for your
+setup.
+
+| backend | runtime | cold one-shot | warm pool | warm speedup |
+| ------- | ------- | ------------- | --------- | ------------ |
+| docker (rootless podman) | default | ~540 ms | ~390 ms | ~1.4x |
+| k8s | runc | ~1.25 s | ~75 ms | ~16x |
+| k8s | gVisor | ~1.45 s | (amortized) | — |
+| k8s | Kata | ~2.6 s | (amortized) | — |
+
+Two things worth reading off this:
+
+- **Warm pooling's payoff depends on the backend.** On k8s it is
+  dramatic — cold pod-creation is heavy (~1.25 s) while exec into a warm
+  holder is ~75 ms, a ~16x win, which is the whole reason `Pool` exists.
+  On rootless podman the win is modest (~1.4x) because podman's per-exec
+  overhead (~400 ms; conmon + userns attach) dominates and there is little
+  cold-start left to amortize. On real dockerd, where `exec` is tens of
+  milliseconds, the pool advantage is far larger than the podman row
+  suggests.
+- **Stronger isolation costs cold-start, not warm throughput.** runc
+  ~1.25 s -> gVisor ~1.45 s (+~15%) -> Kata ~2.6 s (+~2x, it boots a real
+  guest kernel). A warm pool pays that boot once per holder and amortizes
+  it across runs — so the isolation you pay for up front is nearly free
+  per run thereafter. This is the argument for pooling Kata specifically.
+
 ## Alternate runtimes (gVisor, Kata)
 
 `-runtime` selects a stronger isolation runtime where the backend
