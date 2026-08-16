@@ -8,10 +8,34 @@ jobs:
     test:
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v7
-            - uses: actions/setup-go@v7
+            - uses: actions/checkout@v4
+            - uses: actions/setup-go@v5
               with:
                   go-version-file: go.mod
             - run: go vet ./...
             - run: go build ./...
             - run: go test -v -timeout 300s ./...
+
+    test-k8s:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-go@v5
+              with:
+                  go-version-file: go.mod
+
+            - name: Install k3s
+              run: |
+                  curl -sfL https://get.k3s.io | sh -s - --write-kubeconfig-mode 644
+                  # wait for the node to be Ready
+                  for i in $(seq 1 30); do
+                    sudo k3s kubectl get nodes | grep -q ' Ready ' && break
+                    sleep 2
+                  done
+                  sudo k3s kubectl get nodes
+
+            - name: Run k8s backend tests
+              env:
+                  SANDBOX_K8S_TEST: "1"
+                  KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+              run: go test -v -timeout 600s -run 'TestK8s' ./pkg/sandbox/
