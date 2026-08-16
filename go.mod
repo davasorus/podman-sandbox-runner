@@ -1,6 +1,8 @@
-module podman-sandbox-runner
+module github.com/davasorus/podman-sandbox-runner
 
 go 1.26.5
+
+toolchain go1.26.6
 
 require (
 	github.com/docker/docker v28.5.2+incompatible

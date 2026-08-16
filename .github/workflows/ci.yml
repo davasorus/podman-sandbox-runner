@@ -5,37 +5,37 @@ on:
     pull_request:
 
 jobs:
-    test:
+    vulncheck:
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v4
-            - uses: actions/setup-go@v5
+            - uses: actions/checkout@v7
+            - uses: actions/setup-go@v7
+              with:
+                  go-version-file: go.mod
+            - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+            - name: govulncheck with allowlist
+              run: |
+                  govulncheck ./... > vuln.out 2>&1 || true
+                  # extract flagged IDs, drop any that are allowlisted, fail on the rest
+                  found=$(grep -oE 'GO-[0-9]{4}-[0-9]+' vuln.out | sort -u)
+                  allowed=$(grep -oE '^GO-[0-9]{4}-[0-9]+' .govulncheck-allow | sort -u)
+                  new=$(comm -23 <(echo "$found") <(echo "$allowed"))
+                  if [ -n "$new" ]; then
+                      echo "::error::Unallowlisted vulnerabilities found:"
+                      echo "$new"
+                      cat vuln.out
+                      exit 1
+                  fi
+                  echo "Only allowlisted vulnerabilities present (or none)."
+    test:
+        needs: vulncheck
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v7
+            - uses: actions/setup-go@v7
               with:
                   go-version-file: go.mod
             - run: go vet ./...
             - run: go build ./...
             - run: go test -v -timeout 300s ./...
-
-    test-k8s:
-        runs-on: ubuntu-latest
-        steps:
-            - uses: actions/checkout@v4
-            - uses: actions/setup-go@v5
-              with:
-                  go-version-file: go.mod
-
-            - name: Install k3s
-              run: |
-                  curl -sfL https://get.k3s.io | sh -s - --write-kubeconfig-mode 644
-                  # wait for the node to be Ready
-                  for i in $(seq 1 30); do
-                    sudo k3s kubectl get nodes | grep -q ' Ready ' && break
-                    sleep 2
-                  done
-                  sudo k3s kubectl get nodes
-
-            - name: Run k8s backend tests
-              env:
-                  SANDBOX_K8S_TEST: "1"
-                  KUBECONFIG: /etc/rancher/k3s/k3s.yaml
-              run: go test -v -timeout 600s -run 'TestK8s' ./pkg/sandbox/

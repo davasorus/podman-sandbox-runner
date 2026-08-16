@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"podman-sandbox-runner/pkg/sandbox"
+	"github.com/davasorus/podman-sandbox-runner/pkg/sandbox"
 )
 
 // version is overwritten at release build time via

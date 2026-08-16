@@ -1,0 +1,23 @@
+name: codeql
+
+on:
+    push:
+        branches: [live]
+    pull_request:
+    schedule:
+        - cron: "30 6 * * 1" # weekly, catches new query releases
+
+permissions:
+    contents: read
+    security-events: write
+
+jobs:
+    analyze:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - uses: github/codeql-action/init@v3
+              with:
+                  languages: go
+                  build-mode: autobuild
+            - uses: github/codeql-action/analyze@v3
