@@ -7,34 +7,30 @@ import (
 	"sync"
 )
 
-// Pool keeps a warm holder alive and executes runs inside it via the
-// backend's exec mechanism, trading inter-run isolation for latency.
+// holder wraps one backend pool instance. A holder runs at most one
+// workload at a time; its own mutex guards run+cleanup+checkHolder as an
+// indivisible unit so a concurrent dispatch can't observe it mid-hygiene.
+type holder struct {
+	mu   sync.Mutex
+	impl poolImpl
+	dead error
+}
+
+// Pool dispatches runs across one or more warm holders. With size 1 it
+// behaves exactly as a single-holder pool; with size N it serves up to N
+// runs concurrently, additional runs blocking until a holder frees.
 //
-// SECURITY TRADEOFF: unlike one-shot Run, consecutive runs in a pool
-// share a container/pod. Between runs the pool reaps workload
-// processes and clears /work and /tmp, but this hygiene is
-// best-effort: runs in one pool must belong to the same trust domain.
-// For mutually untrusted callers, use one-shot Run or separate pools.
-//
-// Hygiene differs by backend. The docker backend reaps atomically
-// (kill broadcast as the workload uid, which cannot touch the
-// root-side holder). The k8s backend has no per-exec user, so holder
-// and workload share a uid and reaping is enumeration-based — a
-// hostile fork-storm could theoretically race it; the pids limit
-// bounds that race. See the README for the full comparison.
-//
-// Runs are serialized: Pool.Run holds an internal mutex. For
-// concurrency, create multiple pools.
-//
-// Opts.Cmd is ignored (each Run supplies its own command);
-// Opts.Timeout applies per run. On k8s, Opts.NetWait is applied once
-// at pool creation.
+// SECURITY TRADEOFF: see poolImpl / the backend docs. Concurrency does not
+// change the between-run hygiene guarantee (each holder reaps and clears
+// scratch between its own runs); it only adds throughput. Runs dispatched
+// to different holders are as isolated from each other as separate pools.
 type Pool struct {
-	mu     sync.Mutex
-	impl   poolImpl
-	opts   Opts
-	broken error
-	closed bool
+	opts    Opts
+	idle    chan *holder // buffered, cap == size; holds currently-idle holders
+	all     []*holder    // every holder, for Close
+	mu      sync.Mutex
+	closed  bool
+	brokenN int // count of holders that have died
 }
 
 // poolImpl is the per-backend pool machinery. All methods are called
@@ -51,62 +47,119 @@ type poolImpl interface {
 	close(ctx context.Context) error
 }
 
-// NewPool creates and starts the holder for the backend selected by
-// o.Backend. The caller must Close the pool to remove it.
-func NewPool(ctx context.Context, o Opts) (*Pool, error) {
+// NewPool creates and starts `size` warm holders for the backend selected
+// by o.Backend. size < 1 is treated as 1. The caller must Close the pool.
+func NewPool(ctx context.Context, o Opts, size int) (*Pool, error) {
 	if o.User == "" {
 		return nil, fmt.Errorf("pool: Opts.User must be set")
 	}
-	var impl poolImpl
-	var err error
-	switch o.Backend {
-	case "", "auto", "docker":
-		impl, err = newDockerPool(ctx, o)
-	case "k8s":
-		impl, err = newK8sPool(ctx, o)
-	default:
-		return nil, fmt.Errorf("pool: unknown backend %q", o.Backend)
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &Pool{impl: impl, opts: o}, nil
-}
-
-// Run executes cmd in the warm holder. Runs are serialized. stdin may
-// be nil.
-func (p *Pool) Run(ctx context.Context, cmd []string, stdin io.Reader, stdout, stderr io.Writer) (Result, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	var res Result
-	if p.closed {
-		return res, fmt.Errorf("pool: closed")
-	}
-	if p.broken != nil {
-		return res, fmt.Errorf("pool: unusable: %w", p.broken)
+	if size < 1 {
+		size = 1
 	}
 
-	res, runErr := p.impl.run(ctx, cmd, stdin, stdout, stderr)
-
-	// between-runs hygiene, then fail closed if the holder died
-	p.impl.cleanup()
-	if err := p.impl.checkHolder(); err != nil {
-		p.broken = err
-		if runErr == nil {
-			runErr = fmt.Errorf("pool: %w (create a new pool)", err)
+	newImpl := func() (poolImpl, error) {
+		switch o.Backend {
+		case "", "auto", "docker":
+			return newDockerPool(ctx, o)
+		case "k8s":
+			return newK8sPool(ctx, o)
+		default:
+			return nil, fmt.Errorf("pool: unknown backend %q", o.Backend)
 		}
 	}
+
+	p := &Pool{
+		opts: o,
+		idle: make(chan *holder, size),
+		all:  make([]*holder, 0, size),
+	}
+
+	for i := 0; i < size; i++ {
+		impl, err := newImpl()
+		if err != nil {
+			// tear down any holders already created before failing
+			_ = p.Close(context.Background())
+			return nil, fmt.Errorf("pool: creating holder %d/%d: %w", i+1, size, err)
+		}
+		h := &holder{impl: impl}
+		p.all = append(p.all, h)
+		p.idle <- h
+	}
+	return p, nil
+}
+
+// Run acquires an idle holder (blocking until one is free or ctx is done),
+// executes cmd, runs between-run hygiene, and returns the holder to the
+// idle set. If the holder dies during the run it is NOT returned; when all
+// holders have died the pool is unusable.
+func (p *Pool) Run(ctx context.Context, cmd []string, stdin io.Reader, stdout, stderr io.Writer) (Result, error) {
+	var res Result
+
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return res, fmt.Errorf("pool: closed")
+	}
+	if p.brokenN >= len(p.all) {
+		p.mu.Unlock()
+		return res, fmt.Errorf("pool: unusable: all holders have died (create a new pool)")
+	}
+	p.mu.Unlock()
+
+	// acquire an idle holder or give up if the caller's context ends
+	var h *holder
+	select {
+	case h = <-p.idle:
+	case <-ctx.Done():
+		return res, fmt.Errorf("pool: acquiring holder: %w", ctx.Err())
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.dead != nil {
+		// shouldn't happen (dead holders aren't returned to idle), but
+		// guard anyway rather than run against a corpse
+		return res, fmt.Errorf("pool: acquired holder is dead: %w", h.dead)
+	}
+
+	res, runErr := h.impl.run(ctx, cmd, stdin, stdout, stderr)
+
+	// between-runs hygiene, then liveness check
+	h.impl.cleanup()
+	if err := h.impl.checkHolder(); err != nil {
+		h.dead = err
+		p.mu.Lock()
+		p.brokenN++
+		p.mu.Unlock()
+		if runErr == nil {
+			runErr = fmt.Errorf("pool: holder died: %w", err)
+		}
+		// do NOT return h to idle; it stays out of rotation
+		return res, runErr
+	}
+
+	// healthy: back into rotation
+	p.idle <- h
 	return res, runErr
 }
 
-// Close removes the holder. Idempotent.
+// Close tears down every holder. Idempotent.
 func (p *Pool) Close(ctx context.Context) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.closed {
+		p.mu.Unlock()
 		return nil
 	}
 	p.closed = true
-	return p.impl.close(ctx)
+	holders := p.all
+	p.mu.Unlock()
+
+	var firstErr error
+	for _, h := range holders {
+		if err := h.impl.close(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }

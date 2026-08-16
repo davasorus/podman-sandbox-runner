@@ -1,8 +1,7 @@
 module github.com/davasorus/podman-sandbox-runner
 
-go 1.26.5
+go 1.26.6
 
-toolchain go1.26.6
 
 require (
 	github.com/moby/moby/api v1.55.0

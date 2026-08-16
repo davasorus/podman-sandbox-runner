@@ -3,8 +3,10 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -13,7 +15,7 @@ func newTestPool(t *testing.T) *Pool {
 	t.Helper()
 	o := baseOpts() // Cmd unused by pools
 	o.Cmd = nil
-	p, err := NewPool(context.Background(), o)
+	p, err := NewPool(context.Background(), o, 1)
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
@@ -117,7 +119,7 @@ func TestPoolTimeoutLeavesPoolUsable(t *testing.T) {
 	o := baseOpts()
 	o.Cmd = nil
 	o.Timeout = 3 * time.Second
-	p, err := NewPool(context.Background(), o)
+	p, err := NewPool(context.Background(), o, 1)
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
@@ -160,7 +162,7 @@ func newTestK8sPool(t *testing.T) *Pool {
 		CPUs:    1.0,
 		User:    "65534:65534",
 	}
-	p, err := NewPool(context.Background(), o)
+	p, err := NewPool(context.Background(), o, 1)
 	if err != nil {
 		t.Fatalf("NewPool(k8s): %v", err)
 	}
@@ -235,5 +237,95 @@ func TestK8sPoolBackgroundProcessReaped(t *testing.T) {
 	// what we assert against — expect it reaped)
 	if strings.TrimSpace(stdout) != "1" {
 		t.Errorf("sleep count = %q after reap; want 1 (holder's sleep infinity only)", stdout)
+	}
+}
+
+func TestPoolConcurrentThroughput(t *testing.T) {
+	o := baseOpts()
+	o.Cmd = nil
+	o.Timeout = 30 * time.Second
+	const size = 3
+	p, err := NewPool(context.Background(), o, size)
+	if err != nil {
+		t.Fatalf("NewPool(size=%d): %v", size, err)
+	}
+	t.Cleanup(func() { _ = p.Close(context.Background()) })
+
+	// Launch `size` runs that each sleep ~2s. If they run concurrently
+	// across the 3 holders, wall time is ~2s; if serialized, ~6s. Assert
+	// well under the serialized time to prove overlap.
+	const n = size
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	start := time.Now()
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			var out, errBuf bytes.Buffer
+			res, err := p.Run(context.Background(),
+				[]string{"sh", "-c", "sleep 2; echo done"},
+				nil, &out, &errBuf)
+			if err != nil {
+				errs <- fmt.Errorf("run %d: %w", i, err)
+				return
+			}
+			if res.ExitCode != 0 || strings.TrimSpace(out.String()) != "done" {
+				errs <- fmt.Errorf("run %d: exit=%d out=%q", i, res.ExitCode, out.String())
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
+	}
+
+	elapsed := time.Since(start)
+	if elapsed > 5*time.Second {
+		t.Errorf("3 concurrent 2s-runs took %v; expected ~2s (overlap), not ~6s (serialized)", elapsed)
+	}
+	t.Logf("3 concurrent runs completed in %v", elapsed)
+}
+
+func TestPoolConcurrentIsolation(t *testing.T) {
+	o := baseOpts()
+	o.Cmd = nil
+	const size = 2
+	p, err := NewPool(context.Background(), o, size)
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Close(context.Background()) })
+
+	// Each of many runs writes a marker to /work then checks nothing else
+	// is there — proving scratch is clean per-run even under concurrent
+	// dispatch across holders. Run more than `size` so holders are reused.
+	const n = 6
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			var out, errBuf bytes.Buffer
+			// count existing /work entries before writing our own
+			res, err := p.Run(context.Background(),
+				[]string{"sh", "-c", "n=$(ls -A /work | wc -l); echo mine > /work/marker; echo $n"},
+				nil, &out, &errBuf)
+			if err != nil {
+				errs <- fmt.Errorf("run %d: %w", i, err)
+				return
+			}
+			if strings.TrimSpace(out.String()) != "0" {
+				errs <- fmt.Errorf("run %d saw %q pre-existing /work entries; scratch not clean", i, strings.TrimSpace(out.String()))
+			}
+			_ = res
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
 	}
 }
