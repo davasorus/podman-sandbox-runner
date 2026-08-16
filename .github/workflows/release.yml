@@ -1,29 +1,147 @@
 name: release
 on:
-    push:
-        tags: ["v*"]
+  push:
+    tags: ["v*"]
 
 permissions:
-    contents: write
-    id-token: write
-    attestations: write
+  contents: write
+  packages: write
+  id-token: write
+  attestations: write
 
 jobs:
-    release:
-        runs-on: ubuntu-latest
-        steps:
-            - uses: actions/checkout@v4
-              with:
-                  fetch-depth: 0 # goreleaser needs full history for the changelog
-            - uses: actions/setup-go@v5
-              with:
-                  go-version-file: go.mod
-            - uses: goreleaser/goreleaser-action@v6
-              with:
-                  version: "~> v2"
-                  args: release --clean
-              env:
-                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # for goreleaser to create
-            - uses: actions/attest-build-provenance@v2
-              with:
-                  subject-path: "dist/*.tar.gz, dist/*.zip, dist/checksums.txt"
+  vulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: govulncheck with allowlist
+        run: |
+          govulncheck ./... > vuln.out 2>&1 || true
+          # extract flagged IDs, drop any that are allowlisted, fail on the rest
+          found=$(grep -oE 'GO-[0-9]{4}-[0-9]+' vuln.out | sort -u)
+          allowed=$(grep -oE '^GO-[0-9]{4}-[0-9]+' .govulncheck-allow | sort -u)
+          new=$(comm -23 <(echo "$found") <(echo "$allowed"))
+          if [ -n "$new" ]; then
+              echo "::error::Unallowlisted vulnerabilities found:"
+              echo "$new"
+              cat vuln.out
+              exit 1
+          fi
+          echo "Only allowlisted vulnerabilities present (or none)."
+  lint:
+    needs: vulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v7
+        with:
+          version: latest
+
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test -v -timeout 300s ./...
+
+  test-k8s:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Install k3s
+        run: |
+          curl -sfL https://get.k3s.io | sh -s - --write-kubeconfig-mode 644
+          for i in $(seq 1 30); do
+            sudo k3s kubectl get nodes | grep -q ' Ready ' && break
+            sleep 2
+          done
+          sudo k3s kubectl get nodes
+
+      - name: Install gVisor (runsc + containerd shim)
+        run: |
+          set -euo pipefail
+          ARCH=$(uname -m)
+          URL=https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}
+          wget -q ${URL}/runsc ${URL}/runsc.sha512 \
+                  ${URL}/containerd-shim-runsc-v1 ${URL}/containerd-shim-runsc-v1.sha512
+          sha512sum -c runsc.sha512 containerd-shim-runsc-v1.sha512
+          chmod +x runsc containerd-shim-runsc-v1
+          sudo mv runsc containerd-shim-runsc-v1 /usr/local/bin/
+
+      - name: Register runsc with k3s containerd
+        run: |
+          set -euo pipefail
+          CFG=/var/lib/rancher/k3s/agent/etc/containerd/config.toml
+          sudo cp "$CFG" "$CFG.tmpl"
+          # detect containerd config schema (2.x vs 1.x plugin key)
+          if sudo grep -q "io.containerd.cri.v1.runtime" "$CFG"; then
+            KEY="plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc"
+          else
+            KEY='plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runsc'
+          fi
+          echo "" | sudo tee -a "$CFG.tmpl"
+          echo "[$KEY]" | sudo tee -a "$CFG.tmpl"
+          echo '  runtime_type = "io.containerd.runsc.v1"' | sudo tee -a "$CFG.tmpl"
+          sudo systemctl restart k3s
+          for i in $(seq 1 30); do
+            sudo k3s kubectl get nodes | grep -q ' Ready ' && break
+            sleep 2
+          done
+
+      - name: Create gvisor RuntimeClass and smoke-test
+        run: |
+          printf 'apiVersion: node.k8s.io/v1\nkind: RuntimeClass\nmetadata:\n  name: gvisor\nhandler: runsc\n' | sudo k3s kubectl apply -f -
+          for i in $(seq 1 30); do
+            sudo k3s kubectl get serviceaccount default -n default > /dev/null 2>&1 && break
+            sleep 2
+          done
+          sudo k3s kubectl run gvisor-probe --restart=Never --image=alpine --overrides='{"spec":{"runtimeClassName":"gvisor"}}' -- uname -a
+          for i in $(seq 1 30); do
+            PHASE=$(sudo k3s kubectl get pod gvisor-probe -o jsonpath='{.status.phase}')
+            [ "$PHASE" = "Succeeded" ] && break
+            sleep 2
+          done
+          sudo k3s kubectl logs gvisor-probe | grep -- '-gvisor' || (sudo k3s kubectl describe pod gvisor-probe; exit 1)
+          sudo k3s kubectl delete pod gvisor-probe
+
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # goreleaser needs full history for the changelog
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # for goreleaser to create
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/*.tar.gz, dist/*.zip, dist/checksums.txt"

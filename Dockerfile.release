@@ -1,0 +1,3 @@
+FROM gcr.io/distroless/static:nonroot
+COPY sandbox /usr/local/bin/sandbox
+ENTRYPOINT ["/usr/local/bin/sandbox"]

@@ -41,3 +41,17 @@ changelog:
 
 release:
   draft: false
+
+dockers:
+  - image_templates:
+      - "ghcr.io/davasorus/podman-sandbox-runner:{{ .Version }}-amd64"
+      - "ghcr.io/davasorus/podman-sandbox-runner:latest"
+    dockerfile: Dockerfile.release
+    use: buildx
+    goos: linux
+    goarch: amd64
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.source=https://github.com/davasorus/podman-sandbox-runner"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
