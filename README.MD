@@ -223,7 +223,8 @@ go test -v -timeout 300s ./...     # docker-backend suite; needs a docker/podman
 
 The suite covers both backends: the docker-backend tests run against
 Docker on GitHub runners, and the k8s-backend tests run against a k3s
-cluster installed in CI. The k8s tests are gated behind
-`SANDBOX_K8S_TEST=1`; the gVisor runtime test is additionally gated
-behind `SANDBOX_GVISOR_TEST=1` and requires a `gvisor` RuntimeClass —
-it is not run in CI.
+cluster installed in CI — including gVisor, which CI installs (runsc +
+containerd shim + RuntimeClass) and exercises. The k8s tests are gated
+behind `SANDBOX_K8S_TEST=1`; the gVisor runtime test additionally
+behind `SANDBOX_GVISOR_TEST=1`, requiring a `gvisor` RuntimeClass on
+whatever cluster runs them.
