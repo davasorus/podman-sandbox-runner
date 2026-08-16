@@ -38,8 +38,11 @@ func main() {
 	if len(os.Args) >= 2 && os.Args[1] == "serve" {
 		os.Exit(runServe(os.Args[2:]))
 	}
+	if len(os.Args) >= 2 && os.Args[1] == "mcp" {
+		os.Exit(runMCP(os.Args[2:]))
+	}
 	if len(os.Args) < 2 || os.Args[1] != "run" {
-		fmt.Fprintln(os.Stderr, "usage: sandbox run [flags] -- <command...> | sandbox serve [flags] | sandbox version")
+		fmt.Fprintln(os.Stderr, "usage: sandbox run [flags] -- <command...> | sandbox serve [flags] | sandbox mcp [flags] | sandbox version")
 		os.Exit(2)
 	}
 

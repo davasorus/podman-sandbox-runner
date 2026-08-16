@@ -214,6 +214,52 @@ who can reach its socket or port.
   ability to run arbitrary sandboxed commands. There is no TLS — do not
   expose it beyond localhost.
 
+## MCP server (`sandbox mcp`)
+
+`sandbox mcp` exposes the sandbox as [Model Context Protocol](https://modelcontextprotocol.io)
+tools over stdio, so an MCP-capable agent can run code in the sandbox as a
+tool call. It speaks MCP via the official Go SDK.
+
+Two tools are registered:
+
+- **`run_sandbox`** — run an explicit command (`cmd` array), with optional
+  `stdin` and an optional per-call `image` override.
+- **`run_script`** — run a script string via an interpreter that reads the
+  program from stdin (`python3`, `sh`, `bash`, `node`, ...); internally this
+  runs `<interpreter> -` with the script on stdin, so it needs no writable
+  mount and behaves identically in both execution modes.
+
+Both return stdout, stderr, exit code, and the timed-out / OOM-killed flags
+as structured output (plus a human-readable text summary).
+
+Two execution modes:
+
+- **one-shot** (default) — each tool call runs a fresh, cold container;
+  fully isolated, and a per-call `image` override is allowed.
+- **pooled** (`-pool`) — the server holds a warm pool (the same autoscaling
+  machinery as `serve`), so repeated calls exec into warm holders with much
+  lower per-call latency. This carries the same same-trust-domain caveat as
+  Warm pools above, and the image is fixed at pool creation (per-call
+  overrides are rejected). Pool sizing: `-min`, `-max`, `-idle`.
+
+An MCP client launches it as a subprocess over stdio. Example client config:
+
+```json
+{
+  "mcpServers": {
+    "sandbox": {
+      "command": "sandbox",
+      "args": ["mcp", "-image", "docker.io/library/python:3-alpine"]
+    }
+  }
+}
+```
+
+Add `-pool` (and `-min`/`-max`/`-idle`) to `args` for warm pooling. The
+sandbox flags (`-image`, `-mem`, `-cpus`, `-user`, `-runtime`, `-backend`,
+`-timeout`) apply to every call the server executes and are fixed for its
+lifetime.
+
 ## Benchmarks
 
 Two ways to measure: `go test -bench` (idiomatic, CI-graphable) and
