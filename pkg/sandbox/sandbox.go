@@ -13,13 +13,14 @@ type Opts struct {
 	Image     string
 	Cmd       []string
 	Timeout   time.Duration
+	NetWait   time.Duration // k8s only: init-container delay so NetworkPolicy takes effect before the command runs
 	MemMB     int64
 	CPUs      float64
-	User      string   // uid:gid; empty = image default
-	Binds     []string // host:container[:ro] — ro is enforced regardless
-	Env       []string // KEY=VAL
+	User      string
+	Binds     []string
+	Env       []string
 	WithStdin bool
-	Backend   string // "auto" | "docker" (docker API: docker & podman) | "k8s" (phase 2)
+	Backend   string
 }
 
 // Result is the outcome of a sandboxed run.
@@ -45,7 +46,7 @@ func New(o Opts) (Backend, error) {
 	case "", "auto", "docker":
 		return &dockerBackend{}, nil
 	case "k8s":
-		return nil, fmt.Errorf("k8s backend not implemented yet")
+		return &k8sBackend{}, nil
 	default:
 		return nil, fmt.Errorf("unknown backend %q", o.Backend)
 	}

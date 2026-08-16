@@ -39,6 +39,7 @@ func main() {
 	backend := fs.String("backend", "auto", "execution backend: auto|docker|k8s")
 	stdinFlag := fs.Bool("i", false, "pipe stdin into the container")
 	jsonFlag := fs.Bool("json", false, "emit result as JSON instead of streaming")
+	netwait := fs.Duration("netwait", 0, "k8s only: delay start so network policy is enforced first (e.g. 3s)")
 	var vols, envs multiFlag
 	fs.Var(&vols, "v", "mount host file/dir read-only: /host/path:/container/path (repeatable)")
 	fs.Var(&envs, "env", "environment variable KEY=VAL (repeatable)")
@@ -48,6 +49,7 @@ func main() {
 	if len(cmd) == 0 {
 		fmt.Fprintln(os.Stderr, "no command given after flags")
 		os.Exit(2)
+
 	}
 
 	binds := make([]string, 0, len(vols))
@@ -78,6 +80,7 @@ func main() {
 		Env:       envs,
 		WithStdin: *stdinFlag,
 		Backend:   *backend,
+		NetWait:   *netwait,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
