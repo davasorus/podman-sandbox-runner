@@ -10,6 +10,7 @@ import (
 )
 
 func TestDockerSeccompBlocksMount(t *testing.T) {
+	requireDocker(t)
 	okOpts := baseOpts("echo", "hello")
 	okOpts.Backend = "docker"
 	var okOut, okErr bytes.Buffer
@@ -34,6 +35,7 @@ func TestDockerSeccompBlocksMount(t *testing.T) {
 }
 
 func TestSecurityOptsContainsSeccomp(t *testing.T) {
+	requireDocker(t)
 	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		t.Skipf("no docker/podman client available: %v", err)

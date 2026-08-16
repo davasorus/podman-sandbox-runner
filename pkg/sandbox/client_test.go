@@ -10,6 +10,7 @@ import (
 )
 
 func TestSubmitHTTP(t *testing.T) {
+	requireDocker(t)
 	srv := newTestServer(t)
 	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
@@ -27,6 +28,7 @@ func TestSubmitHTTP(t *testing.T) {
 }
 
 func TestSubmitUnix(t *testing.T) {
+	requireDocker(t)
 	o := baseOpts()
 	o.Cmd = nil
 	p, err := NewPool(context.Background(), o, PoolConfig{Min: 1, Max: 2})

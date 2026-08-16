@@ -14,6 +14,7 @@ import (
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
+	requireDocker(t)
 	o := baseOpts()
 	o.Cmd = nil
 	p, err := NewPool(context.Background(), o, PoolConfig{Min: 1, Max: 2})
@@ -119,6 +120,7 @@ func TestServerEmptyCommand(t *testing.T) {
 }
 
 func TestServerUnixRun(t *testing.T) {
+	requireDocker(t)
 	o := baseOpts()
 	o.Cmd = nil
 	p, err := NewPool(context.Background(), o, PoolConfig{Min: 1, Max: 2})
