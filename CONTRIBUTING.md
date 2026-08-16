@@ -10,8 +10,9 @@ PRs welcome. Ground rules:
   `SANDBOX_K8S_TEST=1 go test -v -timeout 600s -run TestK8s ./pkg/sandbox/`
 - The gVisor runtime test is additionally gated behind
   `SANDBOX_GVISOR_TEST=1` and requires a `gvisor` RuntimeClass on the
-  cluster (runsc + containerd shim installed). It is not run in CI;
-  run it locally when touching runtime selection.
+  cluster (runsc + containerd shim installed). CI installs gVisor into
+  its k3s cluster and runs it; locally, run it only if your cluster
+  has the RuntimeClass.
 - Security-relevant changes (anything touching the container/pod
   configuration in `pkg/sandbox/`) should say so in the PR description.
 - New dependencies must pass the govulncheck CI gate; exceptions

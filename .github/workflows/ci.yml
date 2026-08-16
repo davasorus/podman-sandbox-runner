@@ -31,7 +31,7 @@ jobs:
                       exit 1
                   fi
                   echo "Only allowlisted vulnerabilities present (or none)."
-    link:
+    lint:
         needs: vulncheck
         runs-on: ubuntu-latest
         steps:
@@ -44,7 +44,7 @@ jobs:
                   version: latest
 
     test:
-        needs: link
+        needs: lint
         runs-on: ubuntu-latest
         steps:
             - uses: actions/checkout@v7
@@ -54,3 +54,65 @@ jobs:
             - run: go vet ./...
             - run: go build ./...
             - run: go test -v -timeout 300s ./...
+
+    test-k8s:
+        needs: lint
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v7
+            - uses: actions/setup-go@v7
+              with:
+                  go-version-file: go.mod
+
+            - name: Install k3s
+              run: |
+                  curl -sfL https://get.k3s.io | sh -s - --write-kubeconfig-mode 644
+                  for i in $(seq 1 30); do
+                    sudo k3s kubectl get nodes | grep -q ' Ready ' && break
+                    sleep 2
+                  done
+                  sudo k3s kubectl get nodes
+
+            - name: Install gVisor (runsc + containerd shim)
+              run: |
+                  set -euo pipefail
+                  ARCH=$(uname -m)
+                  URL=https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}
+                  wget -q ${URL}/runsc ${URL}/runsc.sha512 \
+                          ${URL}/containerd-shim-runsc-v1 ${URL}/containerd-shim-runsc-v1.sha512
+                  sha512sum -c runsc.sha512 containerd-shim-runsc-v1.sha512
+                  chmod +x runsc containerd-shim-runsc-v1
+                  sudo mv runsc containerd-shim-runsc-v1 /usr/local/bin/
+
+            - name: Register runsc with k3s containerd
+              run: |
+                  set -euo pipefail
+                  CFG=/var/lib/rancher/k3s/agent/etc/containerd/config.toml
+                  sudo cp "$CFG" "$CFG.tmpl"
+                  # detect containerd config schema (2.x vs 1.x plugin key)
+                  if sudo grep -q "io.containerd.cri.v1.runtime" "$CFG"; then
+                    KEY="plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc"
+                  else
+                    KEY='plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runsc'
+                  fi
+                  echo "" | sudo tee -a "$CFG.tmpl"
+                  echo "[$KEY]" | sudo tee -a "$CFG.tmpl"
+                  echo '  runtime_type = "io.containerd.runsc.v1"' | sudo tee -a "$CFG.tmpl"
+                  sudo systemctl restart k3s
+                  for i in $(seq 1 30); do
+                    sudo k3s kubectl get nodes | grep -q ' Ready ' && break
+                    sleep 2
+                  done
+
+            - name: Create gvisor RuntimeClass and smoke-test
+              run: |
+                  sudo k3s kubectl apply -f - << 'EOF'
+                  apiVersion: node.k8s.io/v1
+                  kind: RuntimeClass
+                  metadata:
+                    name: gvisor
+                  handler: runsc
+                  EOF
+                  sudo k3s kubectl run gvisor-probe --restart=Never \
+                    --image=alpine --overrides='{"spec":{"runtimeClassName":"gvisor"}}' -- uname -a
+                  for i in $(seq 1 30); do
