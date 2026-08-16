@@ -44,17 +44,18 @@ func TestK8sBasicExecution(t *testing.T) {
 	}
 }
 
-func TestK8sExitCodeAndMergedOutput(t *testing.T) {
-	res, stdout, err := runK8s(t, k8sOpts(t, "sh", "-c", "echo out; echo err >&2; exit 3"))
+func TestK8sExitCodeAndStreamSeparation(t *testing.T) {
+	o := k8sOpts(t, "sh", "-c", "echo out; echo err >&2; exit 3")
+	var outBuf, errBuf bytes.Buffer
+	res, err := (&k8sBackend{}).Run(context.Background(), o, nil, &outBuf, &errBuf)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if res.ExitCode != 3 {
 		t.Errorf("exit = %d, want 3", res.ExitCode)
 	}
-	// k8s merges streams into stdout — both lines must be present
-	if !strings.Contains(stdout, "out") || !strings.Contains(stdout, "err") {
-		t.Errorf("stdout = %q, want both out and err lines", stdout)
+	if strings.TrimSpace(outBuf.String()) != "out" || strings.TrimSpace(errBuf.String()) != "err" {
+		t.Errorf("streams = %q / %q, want out / err (separated)", outBuf.String(), errBuf.String())
 	}
 }
 

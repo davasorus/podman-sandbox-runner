@@ -3,6 +3,7 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/remotecommand"
+	utilexec "k8s.io/client-go/util/exec"
 
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -53,6 +55,10 @@ func (k *k8sBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout, s
 		return res, err
 	}
 
+	if len(o.Binds) > 0 {
+		return res, fmt.Errorf("k8s backend: -v host mounts not supported (host paths are node paths); use -i or bake files into the image")
+	}
+
 	ns := os.Getenv("SANDBOX_NAMESPACE")
 	if ns == "" {
 		ns = "default"
@@ -60,7 +66,7 @@ func (k *k8sBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout, s
 	name := "sandbox-" + rand.String(8)
 
 	uid, gid := int64(65534), int64(65534)
-	useUser := o.User != "" // k8s can't express "image default" per-field; empty = don't set
+	useUser := o.User != ""
 
 	envs := make([]corev1.EnvVar, 0, len(o.Env))
 	for _, e := range o.Env {
@@ -81,6 +87,10 @@ func (k *k8sBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout, s
 	memQ := resource.MustParse(fmt.Sprintf("%dMi", o.MemMB))
 	cpuQ := resource.MustParse(fmt.Sprintf("%dm", int64(o.CPUs*1000)))
 
+	// holder keeps the pod alive; the real command runs via exec.
+	// +30s so the holder never dies before the timeout logic does.
+	holdSecs := int(o.Timeout.Seconds()) + 30
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   name,
@@ -93,11 +103,9 @@ func (k *k8sBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout, s
 			Containers: []corev1.Container{{
 				Name:            "sandbox",
 				Image:           o.Image,
-				Command:         o.Cmd,
+				Command:         []string{"sleep", fmt.Sprintf("%d", holdSecs)},
 				Env:             envs,
 				WorkingDir:      "/work",
-				Stdin:           o.WithStdin,
-				StdinOnce:       o.WithStdin,
 				SecurityContext: secCtx,
 				Resources: corev1.ResourceRequirements{
 					Limits: corev1.ResourceList{
@@ -121,18 +129,6 @@ func (k *k8sBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout, s
 		},
 	}
 
-	if o.NetWait > 0 {
-		pod.Spec.InitContainers = []corev1.Container{{
-			Name:    "netwait",
-			Image:   "docker.io/library/busybox:latest",
-			Command: []string{"sleep", fmt.Sprintf("%d", int(o.NetWait.Seconds()))},
-		}}
-	}
-
-	if len(o.Binds) > 0 {
-		return res, fmt.Errorf("k8s backend: -v host mounts not supported (host paths are node paths); use -i or bake files into the image")
-	}
-
 	if err := ensureIsolationPolicy(ctx, cs, ns); err != nil {
 		return res, fmt.Errorf("network isolation policy: %w", err)
 	}
@@ -149,11 +145,9 @@ func (k *k8sBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout, s
 		cs.CoreV1().Pods(ns).Delete(delCtx, created.Name, metav1.DeleteOptions{GracePeriodSeconds: &grace})
 	}()
 
-	started := time.Now()
 	runCtx, cancel := context.WithTimeout(ctx, o.Timeout)
 	defer cancel()
 
-	// wait for the pod to leave Pending (attach needs a running container)
 	if err := waitPodRunning(runCtx, cs, ns, created.Name); err != nil {
 		if runCtx.Err() != nil {
 			res.TimedOut = true
@@ -162,63 +156,65 @@ func (k *k8sBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout, s
 		return res, err
 	}
 
-	// stdin needs a live attach; output comes from the logs API afterward
-	// (attach can't connect before start, so fast containers would lose output)
-	if o.WithStdin {
-		req := cs.CoreV1().RESTClient().Post().
-			Resource("pods").Namespace(ns).Name(created.Name).
-			SubResource("attach").
-			VersionedParams(&corev1.PodAttachOptions{
-				Container: "sandbox",
-				Stdin:     true,
-				Stdout:    true, // must consume streams for stdin to flow
-				Stderr:    true,
-			}, scheme.ParameterCodec)
-
-		exec, err := remotecommand.NewSPDYExecutor(cfg, "POST", req.URL())
-		if err != nil {
-			return res, fmt.Errorf("executor: %w", err)
+	// netwait: let the CNI program NetworkPolicy rules before the command runs
+	if o.NetWait > 0 {
+		select {
+		case <-time.After(o.NetWait):
+		case <-runCtx.Done():
+			res.TimedOut = true
+			return res, fmt.Errorf("timed out during netwait")
 		}
-		go exec.StreamWithContext(runCtx, remotecommand.StreamOptions{
-			Stdin:  stdin,
-			Stdout: io.Discard, // real output comes from logs; avoid duplicates
-			Stderr: io.Discard,
-		})
 	}
 
-	// wait for terminal phase
-	exitCode, waitErr := waitPodDone(runCtx, cs, ns, created.Name)
+	req := cs.CoreV1().RESTClient().Post().
+		Resource("pods").Namespace(ns).Name(created.Name).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: "sandbox",
+			Command:   o.Cmd,
+			Stdin:     o.WithStdin,
+			Stdout:    true,
+			Stderr:    true,
+			TTY:       false, // no TTY = separated streams
+		}, scheme.ParameterCodec)
+
+	executor, err := remotecommand.NewSPDYExecutor(cfg, "POST", req.URL())
+	if err != nil {
+		return res, fmt.Errorf("executor: %w", err)
+	}
+
+	started := time.Now()
+
+	streamErr := executor.StreamWithContext(runCtx, remotecommand.StreamOptions{
+		Stdin:  stdin,
+		Stdout: stdout,
+		Stderr: stderr,
+	})
+
 	res.DurationMS = time.Since(started).Milliseconds()
 
-	if waitErr != nil {
+	if streamErr != nil {
 		if runCtx.Err() != nil {
 			res.TimedOut = true
 			return res, fmt.Errorf("timed out after %s (pod killed)", o.Timeout)
 		}
-		return res, waitErr
-	}
-	res.ExitCode = exitCode
-
-	// full output via logs API (k8s logs merge stdout+stderr; stderr writer unused here)
-	logCtx, logCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer logCancel()
-	if rc, err := cs.CoreV1().Pods(ns).GetLogs(created.Name, &corev1.PodLogOptions{Container: "sandbox"}).Stream(logCtx); err == nil {
-		io.Copy(stdout, rc)
-		rc.Close()
-	}
-
-	// OOM detection: k8s surfaces it as the terminated reason
-	if p, err := cs.CoreV1().Pods(ns).Get(context.Background(), created.Name, metav1.GetOptions{}); err == nil {
-		for _, cst := range p.Status.ContainerStatuses {
-			if cst.State.Terminated != nil && cst.State.Terminated.Reason == "OOMKilled" {
-				res.OOMKilled = true
-			}
+		var codeErr utilexec.CodeExitError
+		if errors.As(streamErr, &codeErr) {
+			res.ExitCode = codeErr.Code
+		} else {
+			return res, fmt.Errorf("exec: %w", streamErr)
 		}
+	}
+
+	// OOM: exec'd processes killed by the cgroup OOM killer surface as 137;
+	// the container status only reports OOMKilled if the holder died, so
+	// exit 137 is the signal here (same caveat as docker now).
+	if res.ExitCode == 137 {
+		res.OOMKilled = true
 	}
 
 	return res, nil
 }
-
 func waitPodRunning(ctx context.Context, cs *kubernetes.Clientset, ns, name string) error {
 	for {
 		p, err := cs.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
