@@ -5,36 +5,21 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 )
 
 // holder wraps one backend pool instance. A holder runs at most one
 // workload at a time; its own mutex guards run+cleanup+checkHolder as an
 // indivisible unit so a concurrent dispatch can't observe it mid-hygiene.
 type holder struct {
-	mu   sync.Mutex
-	impl poolImpl
-	dead error
+	mu       sync.Mutex
+	impl     poolImpl
+	dead     error
+	lastUsed time.Time
 }
 
-// Pool dispatches runs across one or more warm holders. With size 1 it
-// behaves exactly as a single-holder pool; with size N it serves up to N
-// runs concurrently, additional runs blocking until a holder frees.
-//
-// SECURITY TRADEOFF: see poolImpl / the backend docs. Concurrency does not
-// change the between-run hygiene guarantee (each holder reaps and clears
-// scratch between its own runs); it only adds throughput. Runs dispatched
-// to different holders are as isolated from each other as separate pools.
-type Pool struct {
-	opts    Opts
-	idle    chan *holder // buffered, cap == size; holds currently-idle holders
-	all     []*holder    // every holder, for Close
-	mu      sync.Mutex
-	closed  bool
-	brokenN int // count of holders that have died
-}
-
-// poolImpl is the per-backend pool machinery. All methods are called
-// under Pool.mu.
+// poolImpl is the per-backend pool machinery. All methods are called with
+// the owning holder's mutex held.
 type poolImpl interface {
 	// run executes cmd in the holder; it owns per-run timeout handling
 	// and returns TimedOut in the Result when applicable.
@@ -47,17 +32,70 @@ type poolImpl interface {
 	close(ctx context.Context) error
 }
 
-// NewPool creates and starts `size` warm holders for the backend selected
-// by o.Backend. size < 1 is treated as 1. The caller must Close the pool.
-func NewPool(ctx context.Context, o Opts, size int) (*Pool, error) {
+// PoolConfig configures a Pool's autoscaling behavior.
+type PoolConfig struct {
+	// Min holders kept warm at all times (>= 0). Min == 0 permits the
+	// pool to scale to zero when idle, at the cost of a cold create on
+	// the next run.
+	Min int
+	// Max holders under load (>= 1 and >= Min). Runs beyond Max block
+	// until a holder frees.
+	Max int
+	// IdleTimeout closes holders idle longer than this, down to Min.
+	// Zero disables idle reaping (holders live until Close).
+	IdleTimeout time.Duration
+}
+
+func (c PoolConfig) normalize() (PoolConfig, error) {
+	if c.Min < 0 {
+		return c, fmt.Errorf("pool: Min must be >= 0")
+	}
+	if c.Max < 1 {
+		c.Max = 1
+	}
+	if c.Max < c.Min {
+		return c, fmt.Errorf("pool: Max (%d) must be >= Min (%d)", c.Max, c.Min)
+	}
+	return c, nil
+}
+
+// Pool dispatches runs across an autoscaling set of warm holders. It keeps
+// at least cfg.Min holders warm, grows on demand up to cfg.Max, and closes
+// idle holders (down to Min) after cfg.IdleTimeout.
+//
+// SECURITY TRADEOFF: see poolImpl / backend docs. Autoscaling does not
+// change the between-run hygiene guarantee (each holder reaps and clears
+// scratch between its own runs). Holders created to meet demand are fresh,
+// known-good instances identical to those NewPool creates; a holder that
+// dies mid-run is never reused — it is removed and, if demand requires,
+// replaced by a new one.
+type Pool struct {
+	opts Opts
+	cfg  PoolConfig
+
+	mu     sync.Mutex
+	all    map[*holder]struct{} // every live (registered) holder
+	idle   chan *holder         // idle holders available for dispatch (cap Max)
+	closed bool
+
+	newImpl func(context.Context) (poolImpl, error)
+
+	reaperStop chan struct{}
+	reaperDone chan struct{}
+}
+
+// NewPool creates a Pool, eagerly starting cfg.Min warm holders. The
+// caller must Close the pool to release resources.
+func NewPool(ctx context.Context, o Opts, cfg PoolConfig) (*Pool, error) {
 	if o.User == "" {
 		return nil, fmt.Errorf("pool: Opts.User must be set")
 	}
-	if size < 1 {
-		size = 1
+	cfg, err := cfg.normalize()
+	if err != nil {
+		return nil, err
 	}
 
-	newImpl := func() (poolImpl, error) {
+	newImpl := func(ctx context.Context) (poolImpl, error) {
 		switch o.Backend {
 		case "", "auto", "docker":
 			return newDockerPool(ctx, o)
@@ -69,82 +107,200 @@ func NewPool(ctx context.Context, o Opts, size int) (*Pool, error) {
 	}
 
 	p := &Pool{
-		opts: o,
-		idle: make(chan *holder, size),
-		all:  make([]*holder, 0, size),
+		opts:       o,
+		cfg:        cfg,
+		all:        make(map[*holder]struct{}),
+		idle:       make(chan *holder, cfg.Max),
+		newImpl:    newImpl,
+		reaperStop: make(chan struct{}),
+		reaperDone: make(chan struct{}),
 	}
 
-	for i := 0; i < size; i++ {
-		impl, err := newImpl()
+	for i := 0; i < cfg.Min; i++ {
+		h, err := p.createHolder(ctx)
 		if err != nil {
-			// tear down any holders already created before failing
 			_ = p.Close(context.Background())
-			return nil, fmt.Errorf("pool: creating holder %d/%d: %w", i+1, size, err)
+			return nil, fmt.Errorf("pool: creating min holder %d/%d: %w", i+1, cfg.Min, err)
 		}
-		h := &holder{impl: impl}
-		p.all = append(p.all, h)
 		p.idle <- h
 	}
+
+	if cfg.IdleTimeout > 0 {
+		go p.reaper()
+	} else {
+		close(p.reaperDone) // no reaper goroutine; Close won't block on it
+	}
+
 	return p, nil
 }
 
-// Run acquires an idle holder (blocking until one is free or ctx is done),
-// executes cmd, runs between-run hygiene, and returns the holder to the
-// idle set. If the holder dies during the run it is NOT returned; when all
-// holders have died the pool is unusable.
-func (p *Pool) Run(ctx context.Context, cmd []string, stdin io.Reader, stdout, stderr io.Writer) (Result, error) {
-	var res Result
+// createHolder builds one holder and registers it in `all`. Caller must
+// NOT hold p.mu.
+func (p *Pool) createHolder(ctx context.Context) (*holder, error) {
+	impl, err := p.newImpl(ctx)
+	if err != nil {
+		return nil, err
+	}
+	h := &holder{impl: impl, lastUsed: time.Now()}
+	p.mu.Lock()
+	p.all[h] = struct{}{}
+	p.mu.Unlock()
+	return h, nil
+}
 
+// acquire returns a holder: an idle one if ready, else a freshly created
+// one if under Max, else it blocks for an idle holder or ctx end.
+func (p *Pool) acquire(ctx context.Context) (*holder, error) {
+	select {
+	case h := <-p.idle:
+		return h, nil
+	default:
+	}
+
+	// try to reserve a create slot atomically
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
-		return res, fmt.Errorf("pool: closed")
+		return nil, fmt.Errorf("pool: closed")
 	}
-	if p.brokenN >= len(p.all) {
+	if len(p.all) < p.cfg.Max {
+		h := &holder{lastUsed: time.Now()}
+		p.all[h] = struct{}{} // reserve the slot now, before building
 		p.mu.Unlock()
-		return res, fmt.Errorf("pool: unusable: all holders have died (create a new pool)")
+
+		impl, err := p.newImpl(ctx)
+		if err != nil {
+			p.mu.Lock()
+			delete(p.all, h) // release the reservation on failure
+			p.mu.Unlock()
+			return nil, fmt.Errorf("pool: scaling up: %w", err)
+		}
+		h.impl = impl
+		return h, nil
 	}
 	p.mu.Unlock()
 
-	// acquire an idle holder or give up if the caller's context ends
-	var h *holder
 	select {
-	case h = <-p.idle:
+	case h := <-p.idle:
+		return h, nil
 	case <-ctx.Done():
-		return res, fmt.Errorf("pool: acquiring holder: %w", ctx.Err())
+		return nil, fmt.Errorf("pool: acquiring holder: %w", ctx.Err())
+	}
+}
+
+// release returns a healthy holder to the idle set, or tears it down if
+// the pool is closing.
+func (p *Pool) release(h *holder) {
+	h.lastUsed = time.Now()
+	p.mu.Lock()
+	if p.closed {
+		delete(p.all, h)
+		p.mu.Unlock()
+		_ = h.impl.close(context.Background())
+		return
+	}
+	p.mu.Unlock()
+	p.idle <- h // cap Max, live <= Max, never blocks
+}
+
+// drop removes a holder from the pool and tears it down.
+func (p *Pool) drop(h *holder) {
+	p.mu.Lock()
+	_, present := p.all[h]
+	delete(p.all, h)
+	p.mu.Unlock()
+	if present {
+		_ = h.impl.close(context.Background())
+	}
+}
+
+// Run acquires a holder (scaling up if needed, blocking at Max), executes
+// cmd, runs between-run hygiene, and returns the holder to the pool. A
+// holder that dies during the run is dropped, not reused.
+func (p *Pool) Run(ctx context.Context, cmd []string, stdin io.Reader, stdout, stderr io.Writer) (Result, error) {
+	var res Result
+
+	h, err := p.acquire(ctx)
+	if err != nil {
+		return res, err
 	}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	if h.dead != nil {
-		// shouldn't happen (dead holders aren't returned to idle), but
-		// guard anyway rather than run against a corpse
+		p.drop(h)
 		return res, fmt.Errorf("pool: acquired holder is dead: %w", h.dead)
 	}
 
 	res, runErr := h.impl.run(ctx, cmd, stdin, stdout, stderr)
 
-	// between-runs hygiene, then liveness check
 	h.impl.cleanup()
 	if err := h.impl.checkHolder(); err != nil {
 		h.dead = err
-		p.mu.Lock()
-		p.brokenN++
-		p.mu.Unlock()
+		p.drop(h)
 		if runErr == nil {
 			runErr = fmt.Errorf("pool: holder died: %w", err)
 		}
-		// do NOT return h to idle; it stays out of rotation
 		return res, runErr
 	}
 
-	// healthy: back into rotation
-	p.idle <- h
+	p.release(h)
 	return res, runErr
 }
 
-// Close tears down every holder. Idempotent.
+// reaper periodically closes holders idle longer than IdleTimeout, never
+// dropping the live count below Min.
+func (p *Pool) reaper() {
+	defer close(p.reaperDone)
+
+	interval := p.cfg.IdleTimeout / 2
+	if interval > 30*time.Second {
+		interval = 30 * time.Second
+	}
+	if interval <= 0 {
+		interval = time.Second
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-p.reaperStop:
+			return
+		case <-t.C:
+			p.reapIdle()
+		}
+	}
+}
+
+// reapIdle closes idle holders past the timeout, keeping >= Min alive.
+func (p *Pool) reapIdle() {
+	now := time.Now()
+	for {
+		p.mu.Lock()
+		live := len(p.all)
+		p.mu.Unlock()
+		if live <= p.cfg.Min {
+			return
+		}
+
+		var h *holder
+		select {
+		case h = <-p.idle:
+		default:
+			return // nothing idle to reap
+		}
+
+		if now.Sub(h.lastUsed) < p.cfg.IdleTimeout {
+			p.idle <- h // youngest-idle not old enough; put back and stop
+			return
+		}
+		p.drop(h)
+	}
+}
+
+// Close stops the reaper and tears down every holder. Idempotent.
 func (p *Pool) Close(ctx context.Context) error {
 	p.mu.Lock()
 	if p.closed {
@@ -152,8 +308,34 @@ func (p *Pool) Close(ctx context.Context) error {
 		return nil
 	}
 	p.closed = true
-	holders := p.all
+	reaperRunning := p.cfg.IdleTimeout > 0
 	p.mu.Unlock()
+
+	// stop the reaper first so it can't pull/drop holders concurrently
+	if reaperRunning {
+		close(p.reaperStop)
+	}
+	<-p.reaperDone
+
+	// now take the definitive holder set and clear it
+	p.mu.Lock()
+	holders := make([]*holder, 0, len(p.all))
+	for h := range p.all {
+		holders = append(holders, h)
+	}
+	p.all = make(map[*holder]struct{})
+	p.mu.Unlock()
+
+	// drain idle channel so any parked holders aren't double-handled
+	// (they're in `holders` already; draining just empties the channel)
+	for {
+		select {
+		case <-p.idle:
+		default:
+			goto closeAll
+		}
+	}
+closeAll:
 
 	var firstErr error
 	for _, h := range holders {

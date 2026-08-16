@@ -15,7 +15,7 @@ func newTestPool(t *testing.T) *Pool {
 	t.Helper()
 	o := baseOpts() // Cmd unused by pools
 	o.Cmd = nil
-	p, err := NewPool(context.Background(), o, 1)
+	p, err := NewPool(context.Background(), o, PoolConfig{Min: 1, Max: 1})
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestPoolTimeoutLeavesPoolUsable(t *testing.T) {
 	o := baseOpts()
 	o.Cmd = nil
 	o.Timeout = 3 * time.Second
-	p, err := NewPool(context.Background(), o, 1)
+	p, err := NewPool(context.Background(), o, PoolConfig{Min: 1, Max: 1})
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
@@ -162,7 +162,7 @@ func newTestK8sPool(t *testing.T) *Pool {
 		CPUs:    1.0,
 		User:    "65534:65534",
 	}
-	p, err := NewPool(context.Background(), o, 1)
+	p, err := NewPool(context.Background(), o, PoolConfig{Min: 1, Max: 1})
 	if err != nil {
 		t.Fatalf("NewPool(k8s): %v", err)
 	}
@@ -245,9 +245,9 @@ func TestPoolConcurrentThroughput(t *testing.T) {
 	o.Cmd = nil
 	o.Timeout = 30 * time.Second
 	const size = 3
-	p, err := NewPool(context.Background(), o, size)
+	p, err := NewPool(context.Background(), o, PoolConfig{Min: 0, Max: size})
 	if err != nil {
-		t.Fatalf("NewPool(size=%d): %v", size, err)
+		t.Fatalf("NewPool: %v", err)
 	}
 	t.Cleanup(func() { _ = p.Close(context.Background()) })
 
@@ -291,8 +291,7 @@ func TestPoolConcurrentThroughput(t *testing.T) {
 func TestPoolConcurrentIsolation(t *testing.T) {
 	o := baseOpts()
 	o.Cmd = nil
-	const size = 2
-	p, err := NewPool(context.Background(), o, size)
+	p, err := NewPool(context.Background(), o, PoolConfig{Min: 2, Max: 2})
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
@@ -327,5 +326,124 @@ func TestPoolConcurrentIsolation(t *testing.T) {
 	close(errs)
 	for e := range errs {
 		t.Error(e)
+	}
+}
+
+// liveCount reports the number of registered holders (test helper).
+func (p *Pool) liveCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.all)
+}
+
+func TestPoolIdleReaperShrinksToMin(t *testing.T) {
+	o := baseOpts()
+	o.Cmd = nil
+	p, err := NewPool(context.Background(), o, PoolConfig{Min: 1, Max: 3, IdleTimeout: 2 * time.Second})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Close(context.Background()) })
+
+	// burst to Max
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var out, e bytes.Buffer
+			_, _ = p.Run(context.Background(), []string{"echo", "hi"}, nil, &out, &e)
+		}()
+	}
+	wg.Wait()
+	if n := p.liveCount(); n < 2 {
+		t.Fatalf("after burst live=%d; expected grow toward Max", n)
+	}
+
+	// wait past idle timeout + a reaper interval or two
+	time.Sleep(5 * time.Second)
+	if n := p.liveCount(); n != 1 {
+		t.Errorf("after idle, live=%d; expected shrink to Min=1", n)
+	}
+}
+
+func TestPoolScaleToZeroThenRun(t *testing.T) {
+	o := baseOpts()
+	o.Cmd = nil
+	p, err := NewPool(context.Background(), o, PoolConfig{Min: 0, Max: 2, IdleTimeout: 2 * time.Second})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Close(context.Background()) })
+
+	// one run creates a holder on demand
+	var out, e bytes.Buffer
+	if _, err := p.Run(context.Background(), []string{"echo", "one"}, nil, &out, &e); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if strings.TrimSpace(out.String()) != "one" {
+		t.Fatalf("first run out=%q", out.String())
+	}
+
+	// idle past timeout -> should scale to zero
+	time.Sleep(5 * time.Second)
+	if n := p.liveCount(); n != 0 {
+		t.Errorf("after idle with Min=0, live=%d; expected 0", n)
+	}
+
+	// a run after scale-to-zero must still work (cold create)
+	out.Reset()
+	if _, err := p.Run(context.Background(), []string{"echo", "two"}, nil, &out, &e); err != nil {
+		t.Fatalf("run after scale-to-zero: %v", err)
+	}
+	if strings.TrimSpace(out.String()) != "two" {
+		t.Errorf("post-zero run out=%q", out.String())
+	}
+}
+
+func TestPoolNeverExceedsMax(t *testing.T) {
+	o := baseOpts()
+	o.Cmd = nil
+	const max = 2
+	p, err := NewPool(context.Background(), o, PoolConfig{Min: 0, Max: max})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Close(context.Background()) })
+
+	stop := make(chan struct{})
+	peak := 0
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				if lc := p.liveCount(); lc > peak {
+					peak = lc
+				}
+				time.Sleep(25 * time.Millisecond)
+			}
+		}
+	}()
+
+	const n = 5
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var out, e bytes.Buffer
+			_, _ = p.Run(context.Background(), []string{"sh", "-c", "sleep 1"}, nil, &out, &e)
+		}()
+	}
+	wg.Wait()
+	close(stop)
+
+	if peak > max {
+		t.Errorf("live count peaked at %d; must never exceed Max=%d", peak, max)
+	}
+	if peak < 1 {
+		t.Errorf("live count never rose above 0; runs didn't execute")
 	}
 }
