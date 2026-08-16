@@ -119,3 +119,54 @@ jobs:
           done
           sudo k3s kubectl logs gvisor-probe | grep -- '-gvisor' || (sudo k3s kubectl describe pod gvisor-probe; exit 1)
           sudo k3s kubectl delete pod gvisor-probe
+
+      - name: Install Kata Containers
+        run: |
+          set -euo pipefail
+          KATA_VER=4.0.0
+          cd /tmp
+          curl -sL "https://github.com/kata-containers/kata-containers/releases/download/${KATA_VER}/kata-static-${KATA_VER}-amd64.tar.zst" -o kata.tar.zst
+          sudo apt-get install -y zstd
+          sudo tar --use-compress-program=unzstd -xf kata.tar.zst -C /
+          sudo ln -sf /opt/kata/bin/containerd-shim-kata-v2 /usr/local/bin/containerd-shim-kata-v2
+          # fail early + informatively if the runner lacks KVM
+          ls -la /dev/kvm || (echo "::error::runner has no /dev/kvm; Kata cannot run here" && exit 1)
+          sudo /opt/kata/bin/kata-runtime check || (echo "::error::kata-runtime check failed on runner" && exit 1)
+
+      - name: Register Kata with k3s containerd
+        run: |
+          set -euo pipefail
+          CFG=/var/lib/rancher/k3s/agent/etc/containerd/config.toml
+          if sudo grep -q "io.containerd.cri.v1.runtime" "$CFG"; then
+            KEY="plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.kata"
+          else
+            KEY='plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata'
+          fi
+          echo "" | sudo tee -a "$CFG.tmpl"
+          echo "[$KEY]" | sudo tee -a "$CFG.tmpl"
+          echo '  runtime_type = "io.containerd.kata.v2"' | sudo tee -a "$CFG.tmpl"
+          sudo systemctl restart k3s
+          for i in $(seq 1 30); do
+            sudo k3s kubectl get serviceaccount default -n default >/dev/null 2>&1 && break
+            sleep 2
+          done
+
+      - name: Create kata RuntimeClass and smoke-test
+        run: |
+          printf 'apiVersion: node.k8s.io/v1\nkind: RuntimeClass\nmetadata:\n  name: kata\nhandler: kata\n' | sudo k3s kubectl apply -f -
+          sudo k3s kubectl run kata-probe --restart=Never --image=alpine --overrides='{"spec":{"runtimeClassName":"kata"}}' -- uname -r
+          for i in $(seq 1 40); do
+            PHASE=$(sudo k3s kubectl get pod kata-probe -o jsonpath='{.status.phase}')
+            { [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "Failed" ]; } && break
+            sleep 3
+          done
+          sudo k3s kubectl logs kata-probe || (sudo k3s kubectl describe pod kata-probe; exit 1)
+          sudo k3s kubectl delete pod kata-probe
+
+      - name: Run k8s backend tests (including gVisor + Kata)
+        env:
+          SANDBOX_K8S_TEST: "1"
+          SANDBOX_GVISOR_TEST: "1"
+          SANDBOX_KATA_TEST: "1"
+          KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+        run: go test -v -timeout 600s -run 'TestK8s' ./pkg/sandbox/

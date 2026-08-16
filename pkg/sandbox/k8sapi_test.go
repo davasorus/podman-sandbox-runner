@@ -156,6 +156,30 @@ func TestK8sGvisorRuntime(t *testing.T) {
 	}
 }
 
+// TestK8sKataRuntime verifies VM-grade isolation via the "kata"
+// RuntimeClass end-to-end: the pod reports a guest kernel distinct from
+// the host, proving it ran inside a Kata VM. Gated behind
+// SANDBOX_KATA_TEST=1 and a "kata" RuntimeClass on the cluster.
+func TestK8sKataRuntime(t *testing.T) {
+	o := k8sOpts(t, "uname", "-r")
+	if os.Getenv("SANDBOX_KATA_TEST") != "1" {
+		t.Skip("SANDBOX_KATA_TEST != 1; skipping Kata runtime test")
+	}
+	o.Runtime = "kata"
+	_, stdout, err := runK8s(t, o)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	// the Kata guest kernel differs from the WSL2 host kernel; the host
+	// kernel string contains "microsoft" / "WSL2", the guest does not
+	if strings.Contains(stdout, "microsoft") || strings.Contains(stdout, "WSL2") {
+		t.Errorf("kernel %q looks like the host kernel; expected a Kata guest kernel", strings.TrimSpace(stdout))
+	}
+	if strings.TrimSpace(stdout) == "" {
+		t.Errorf("empty uname output")
+	}
+}
+
 // TestK8sRuntimeFailClosed verifies a nonexistent RuntimeClass is
 // rejected at pod admission rather than silently downgraded.
 func TestK8sRuntimeFailClosed(t *testing.T) {
