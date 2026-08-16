@@ -1,11 +1,13 @@
 package sandbox
 
 import (
+	"context"
 	_ "embed"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/moby/moby/client"
 )
@@ -57,16 +59,54 @@ func seccompProfileFile() (string, error) {
 // incompatible forms — Docker Engine expects inline JSON, podman's compat
 // API expects a file path — so the value must be formatted per-daemon.
 //
-// Detection is by the client's daemon host (socket address): podman's
-// socket path contains "podman" (e.g. unix:///run/user/1000/podman/
-// podman.sock), whereas Docker's default socket does not. This is a
-// zero-cost client-side check with no server round-trip. If a deployment
-// runs podman behind a non-podman-named socket, the profile would be sent
-// as inline JSON and podman would reject it with an explicit decode error
-// (the same error surfaced before this fix) rather than silently losing
-// the profile — a loud failure, not a silent downgrade.
+// Detection is layered:
+//
+//  1. Socket-path heuristic (zero-cost, no round-trip): podman's socket
+//     path almost always contains "podman" (e.g.
+//     unix:///run/user/1000/podman/podman.sock). A positive match is
+//     conclusive and returns immediately — the common podman case pays
+//     nothing.
+//
+//  2. Server-version fallback (one round-trip), consulted only when the
+//     socket path does NOT positively identify podman — i.e. the ambiguous
+//     case of podman reachable behind a non-podman-named socket. It asks
+//     the daemon to identify itself and looks for "podman" in the version,
+//     platform name, or component names.
+//
+// If the fallback errors or reports Docker, the daemon is treated as Docker
+// (inline JSON). That keeps the common Docker path working even if the
+// version call fails, while correctly catching podman-behind-a-generic-
+// socket, which the socket heuristic alone would misjudge.
 func daemonIsPodman(cli *client.Client) bool {
-	return strings.Contains(strings.ToLower(cli.DaemonHost()), "podman")
+	if strings.Contains(strings.ToLower(cli.DaemonHost()), "podman") {
+		return true
+	}
+	return serverIsPodman(cli)
+}
+
+// serverIsPodman asks the daemon to identify itself. Returns false on any
+// error (treat an unreachable/ambiguous daemon as Docker — the safe default
+// for the inline-JSON form, which Docker Engine accepts and CI uses).
+func serverIsPodman(cli *client.Client) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	v, err := cli.ServerVersion(ctx, client.ServerVersionOptions{})
+	if err != nil {
+		return false
+	}
+	if strings.Contains(strings.ToLower(v.Version), "podman") {
+		return true
+	}
+	if strings.Contains(strings.ToLower(v.Platform.Name), "podman") {
+		return true
+	}
+	for _, c := range v.Components {
+		if strings.Contains(strings.ToLower(c.Name), "podman") {
+			return true
+		}
+	}
+	return false
 }
 
 // securityOpts returns the SecurityOpt list applied to every sandbox
