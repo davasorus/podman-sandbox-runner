@@ -60,8 +60,8 @@ func NewPool(ctx context.Context, o Opts) (*Pool, error) {
 	// pull if not local; errors ignored so local-only images work
 	if _, err := cli.ImageInspect(ctx, o.Image); err != nil {
 		if resp, err := cli.ImagePull(ctx, o.Image, client.ImagePullOptions{}); err == nil {
-			io.Copy(io.Discard, resp)
-			resp.Close()
+			_, _ = io.Copy(io.Discard, resp)
+			_ = resp.Close()
 		}
 	}
 
@@ -94,7 +94,7 @@ func NewPool(ctx context.Context, o Opts) (*Pool, error) {
 		},
 	})
 	if err != nil {
-		cli.Close()
+		_ = cli.Close()
 		return nil, fmt.Errorf("pool: create holder: %w", err)
 	}
 	id := created.ID
@@ -102,8 +102,8 @@ func NewPool(ctx context.Context, o Opts) (*Pool, error) {
 	fail := func(e error) (*Pool, error) {
 		rmCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		cli.ContainerRemove(rmCtx, id, client.ContainerRemoveOptions{Force: true})
-		cli.Close()
+		_, _ = cli.ContainerRemove(rmCtx, id, client.ContainerRemoveOptions{Force: true})
+		_ = cli.Close()
 		return nil, e
 	}
 
@@ -174,8 +174,8 @@ func (p *Pool) Run(ctx context.Context, cmd []string, stdin io.Reader, stdout, s
 
 	if withStdin {
 		go func() {
-			io.Copy(att.Conn, stdin)
-			att.CloseWrite()
+			_, _ = io.Copy(att.Conn, stdin)
+			_ = att.CloseWrite()
 		}()
 	}
 
@@ -243,7 +243,7 @@ func (p *Pool) cleanup() {
 		return
 	}
 	defer att.Close()
-	io.Copy(io.Discard, att.Reader) // TEMP: was io.Copy(io.Discard, ...
+	_, _ = io.Copy(io.Discard, att.Reader) // TEMP: was io.Copy(io.Discard, ...
 }
 
 // checkHolder verifies the holder container is still running.
@@ -271,15 +271,6 @@ func (p *Pool) Close(ctx context.Context) error {
 	rmCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	_, err := p.cli.ContainerRemove(rmCtx, p.id, client.ContainerRemoveOptions{Force: true})
-	p.cli.Close()
+	_ = p.cli.Close()
 	return err
-}
-
-func indexByte(s string, b byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == b {
-			return i
-		}
-	}
-	return -1
 }

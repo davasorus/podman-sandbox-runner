@@ -143,7 +143,7 @@ func (k *k8sBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout, s
 		delCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		grace := int64(0)
-		cs.CoreV1().Pods(ns).Delete(delCtx, created.Name, metav1.DeleteOptions{GracePeriodSeconds: &grace})
+		_ = cs.CoreV1().Pods(ns).Delete(delCtx, created.Name, metav1.DeleteOptions{GracePeriodSeconds: &grace})
 	}()
 
 	runCtx, cancel := context.WithTimeout(ctx, o.Timeout)
@@ -229,31 +229,6 @@ func waitPodRunning(ctx context.Context, cs *kubernetes.Clientset, ns, name stri
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(200 * time.Millisecond):
-		}
-	}
-}
-
-func waitPodDone(ctx context.Context, cs *kubernetes.Clientset, ns, name string) (int, error) {
-	for {
-		p, err := cs.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			return 0, err
-		}
-		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
-			for _, cst := range p.Status.ContainerStatuses {
-				if t := cst.State.Terminated; t != nil {
-					return int(t.ExitCode), nil
-				}
-			}
-			if p.Status.Phase == corev1.PodFailed {
-				return 1, nil
-			}
-			return 0, nil
-		}
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
 		case <-time.After(200 * time.Millisecond):
 		}
 	}

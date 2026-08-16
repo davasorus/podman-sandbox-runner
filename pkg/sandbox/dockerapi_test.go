@@ -140,7 +140,9 @@ func TestMemoryKill(t *testing.T) {
 func TestReadOnlyMount(t *testing.T) {
 	dir := t.TempDir()
 	f := dir + "/hello.txt"
-	if err := os.WriteFile(f, []byte("from host\n"), 0o644); err != nil {
+	// The fixture must be readable by the sandbox user (uid 65534)
+	// inside the container, so it cannot be 0600.
+	if err := os.WriteFile(f, []byte("from host\n"), 0o644); err != nil { //nolint:gosec // world-readable by design: read across uid boundary
 		t.Fatal(err)
 	}
 

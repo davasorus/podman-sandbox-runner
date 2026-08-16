@@ -16,7 +16,7 @@ func newTestPool(t *testing.T) *Pool {
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
-	t.Cleanup(func() { p.Close(context.Background()) })
+	t.Cleanup(func() { _ = p.Close(context.Background()) })
 	return p
 }
 
@@ -120,7 +120,7 @@ func TestPoolTimeoutLeavesPoolUsable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
-	t.Cleanup(func() { p.Close(context.Background()) })
+	t.Cleanup(func() { _ = p.Close(context.Background()) })
 
 	res, _, _, err := poolRun(t, p, "sleep", "60")
 	if err == nil || !res.TimedOut {
@@ -140,7 +140,7 @@ func TestPoolTimeoutLeavesPoolUsable(t *testing.T) {
 
 func TestPoolClosedRejectsRuns(t *testing.T) {
 	p := newTestPool(t)
-	p.Close(context.Background())
+	_ = p.Close(context.Background())
 	if _, _, _, err := poolRun(t, p, "echo", "hi"); err == nil {
 		t.Error("run on closed pool succeeded; want error")
 	}

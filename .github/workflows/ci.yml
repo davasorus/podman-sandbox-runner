@@ -31,8 +31,20 @@ jobs:
                       exit 1
                   fi
                   echo "Only allowlisted vulnerabilities present (or none)."
-    test:
+    link:
         needs: vulncheck
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v7
+            - uses: actions/setup-go@v7
+              with:
+                  go-version-file: go.mod
+            - uses: golangci/golangci-lint-action@v7
+              with:
+                  version: latest
+
+    test:
+        needs: link
         runs-on: ubuntu-latest
         steps:
             - uses: actions/checkout@v7

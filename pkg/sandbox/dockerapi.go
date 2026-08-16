@@ -20,14 +20,14 @@ func (d *dockerBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout
 	if err != nil {
 		return res, fmt.Errorf("connecting to socket: %w", err)
 	}
-	defer cli.Close()
+	defer func() { _ = cli.Close() }()
 
 	// pull if not local; errors ignored so local-only images work
 	if _, err := cli.ImageInspect(ctx, o.Image); err != nil {
-		fmt.Fprintf(stderr, "pulling %s...\n", o.Image)
+		_, _ = fmt.Fprintf(stderr, "pulling %s...\n", o.Image)
 		if resp, err := cli.ImagePull(ctx, o.Image, client.ImagePullOptions{}); err == nil {
-			io.Copy(io.Discard, resp)
-			resp.Close()
+			_, _ = io.Copy(io.Discard, resp)
+			_ = resp.Close()
 		}
 	}
 
@@ -72,7 +72,7 @@ func (d *dockerBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout
 	defer func() {
 		rmCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		cli.ContainerRemove(rmCtx, id, client.ContainerRemoveOptions{Force: true})
+		_, _ = cli.ContainerRemove(rmCtx, id, client.ContainerRemoveOptions{Force: true})
 	}()
 
 	// Podman's Docker-compat API silently ignores HostConfig.Runtime;
@@ -110,8 +110,8 @@ func (d *dockerBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout
 	// pump stdin if requested
 	if o.WithStdin && stdin != nil {
 		go func() {
-			io.Copy(att.Conn, stdin)
-			att.CloseWrite() // signal EOF to the container
+			_, _ = io.Copy(att.Conn, stdin)
+			_ = att.CloseWrite() // signal EOF to the container
 		}()
 	}
 

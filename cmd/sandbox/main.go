@@ -53,7 +53,7 @@ func main() {
 	var vols, envs multiFlag
 	fs.Var(&vols, "v", "mount host file/dir read-only: /host/path:/container/path (repeatable)")
 	fs.Var(&envs, "env", "environment variable KEY=VAL (repeatable)")
-	fs.Parse(os.Args[2:])
+	_ = fs.Parse(os.Args[2:])
 
 	cmd := fs.Args()
 	if len(cmd) == 0 {
@@ -108,7 +108,9 @@ func main() {
 		if err != nil {
 			res.Error = err.Error()
 		}
-		json.NewEncoder(os.Stdout).Encode(res)
+		if err := json.NewEncoder(os.Stdout).Encode(res); err != nil {
+			fmt.Fprintln(os.Stderr, "sandbox: encoding result:", err)
+		}
 		if err != nil {
 			os.Exit(125)
 		}
