@@ -16,6 +16,10 @@ import (
 	"podman-sandbox-runner/pkg/sandbox"
 )
 
+// version is overwritten at release build time via
+// -ldflags "-X main.version={{.Version}}" (see .goreleaser.yaml).
+var version = "dev"
+
 type multiFlag []string
 
 func (m *multiFlag) String() string { return strings.Join(*m, ",") }
@@ -25,8 +29,13 @@ func (m *multiFlag) Set(v string) error {
 }
 
 func main() {
+	if len(os.Args) >= 2 && os.Args[1] == "version" {
+		fmt.Println("sandbox", version)
+		return
+	}
+
 	if len(os.Args) < 2 || os.Args[1] != "run" {
-		fmt.Fprintln(os.Stderr, "usage: sandbox run [flags] -- <command...>")
+		fmt.Fprintln(os.Stderr, "usage: sandbox run [flags] -- <command...> | sandbox version")
 		os.Exit(2)
 	}
 
@@ -37,9 +46,9 @@ func main() {
 	cpus := fs.Float64("cpus", 1.0, "CPU limit (cores)")
 	user := fs.String("user", "65534:65534", "run as user (uid:gid); empty = image default")
 	backend := fs.String("backend", "auto", "execution backend: auto|docker|k8s")
+	netwait := fs.Duration("netwait", 0, "k8s only: delay start so network policy is enforced first (e.g. 3s)")
 	stdinFlag := fs.Bool("i", false, "pipe stdin into the container")
 	jsonFlag := fs.Bool("json", false, "emit result as JSON instead of streaming")
-	netwait := fs.Duration("netwait", 0, "k8s only: delay start so network policy is enforced first (e.g. 3s)")
 	var vols, envs multiFlag
 	fs.Var(&vols, "v", "mount host file/dir read-only: /host/path:/container/path (repeatable)")
 	fs.Var(&envs, "env", "environment variable KEY=VAL (repeatable)")
@@ -49,7 +58,6 @@ func main() {
 	if len(cmd) == 0 {
 		fmt.Fprintln(os.Stderr, "no command given after flags")
 		os.Exit(2)
-
 	}
 
 	binds := make([]string, 0, len(vols))
@@ -73,6 +81,7 @@ func main() {
 		Image:     *image,
 		Cmd:       cmd,
 		Timeout:   *timeout,
+		NetWait:   *netwait,
 		MemMB:     *mem,
 		CPUs:      *cpus,
 		User:      *user,
@@ -80,7 +89,6 @@ func main() {
 		Env:       envs,
 		WithStdin: *stdinFlag,
 		Backend:   *backend,
-		NetWait:   *netwait,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -91,12 +99,9 @@ func main() {
 		stdin = os.Stdin
 	}
 
-	var res sandbox.Result
-	var err error
-
 	if *jsonFlag {
 		var outBuf, errBuf bytes.Buffer
-		res, err = sandbox.Run(ctx, o, stdin, &outBuf, &errBuf)
+		res, err := sandbox.Run(ctx, o, stdin, &outBuf, &errBuf)
 		res.Stdout, res.Stderr = outBuf.String(), errBuf.String()
 		if err != nil {
 			res.Error = err.Error()
@@ -108,7 +113,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	res, err = sandbox.Run(ctx, o, stdin, os.Stdout, os.Stderr)
+	res, err := sandbox.Run(ctx, o, stdin, os.Stdout, os.Stderr)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "sandbox:", err)
 		os.Exit(125)
