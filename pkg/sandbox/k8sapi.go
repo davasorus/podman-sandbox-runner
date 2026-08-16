@@ -79,6 +79,7 @@ func (k *k8sBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout, s
 		ReadOnlyRootFilesystem:   ptr(true),
 		AllowPrivilegeEscalation: ptr(false),
 		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+		SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 	}
 	if useUser {
 		secCtx.RunAsUser, secCtx.RunAsGroup, secCtx.RunAsNonRoot = &uid, &gid, ptr(true)
@@ -216,6 +217,7 @@ func (k *k8sBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout, s
 
 	return res, nil
 }
+
 func waitPodRunning(ctx context.Context, cs *kubernetes.Clientset, ns, name string) error {
 	for {
 		p, err := cs.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})

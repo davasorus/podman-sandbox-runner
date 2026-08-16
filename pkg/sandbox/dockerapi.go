@@ -50,7 +50,7 @@ func (d *dockerBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout
 			AutoRemove:     false, // we remove manually in the deferred cleanup
 			ReadonlyRootfs: true,
 			CapDrop:        []string{"ALL"},
-			SecurityOpt:    []string{"no-new-privileges"},
+			SecurityOpt:    securityOpts(),
 			Binds:          o.Binds,
 			Tmpfs: map[string]string{
 				"/work": "rw,size=64m,mode=1777",

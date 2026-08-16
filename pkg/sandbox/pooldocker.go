@@ -43,7 +43,7 @@ func newDockerPool(ctx context.Context, o Opts) (*dockerPool, error) {
 			AutoRemove:     false,
 			ReadonlyRootfs: true,
 			CapDrop:        []string{"ALL"},
-			SecurityOpt:    []string{"no-new-privileges"},
+			SecurityOpt:    securityOpts(),
 			Binds:          o.Binds,
 			Tmpfs: map[string]string{
 				"/work": "rw,size=64m,mode=1777",
