@@ -27,6 +27,7 @@ func baseOpts(cmd ...string) Opts {
 // (timeout tests assert on that themselves).
 func runTest(t *testing.T, o Opts) (Result, string, string, error) {
 	t.Helper()
+	requireDocker(t)
 	var out, errBuf bytes.Buffer
 	res, err := (&dockerBackend{}).Run(context.Background(), o, nil, &out, &errBuf)
 	return res, out.String(), errBuf.String(), err

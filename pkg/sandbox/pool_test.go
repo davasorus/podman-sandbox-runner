@@ -13,6 +13,7 @@ import (
 
 func newTestPool(t *testing.T) *Pool {
 	t.Helper()
+	requireDocker(t)
 	o := baseOpts() // Cmd unused by pools
 	o.Cmd = nil
 	p, err := NewPool(context.Background(), o, PoolConfig{Min: 1, Max: 1})
