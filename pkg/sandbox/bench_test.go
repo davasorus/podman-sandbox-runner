@@ -92,3 +92,28 @@ func BenchmarkWarmPool_K8s(b *testing.B) {
 	o.Backend = "k8s"
 	benchWarmPool(b, o)
 }
+
+// --- runtime comparison (k8s cold path) ---
+// Runtime cost is a cold-start phenomenon: a warm pool amortizes holder
+// creation, so the runtime's boot cost is paid once, not per run. These
+// measure the cold penalty of stronger isolation.
+
+func BenchmarkColdOneShot_K8s_Gvisor(b *testing.B) {
+	if os.Getenv("SANDBOX_K8S_TEST") != "1" || os.Getenv("SANDBOX_GVISOR_TEST") != "1" {
+		b.Skip("needs SANDBOX_K8S_TEST=1 and SANDBOX_GVISOR_TEST=1")
+	}
+	o := baseOpts("true")
+	o.Backend = "k8s"
+	o.Runtime = "gvisor"
+	benchColdOneShot(b, o)
+}
+
+func BenchmarkColdOneShot_K8s_Kata(b *testing.B) {
+	if os.Getenv("SANDBOX_K8S_TEST") != "1" || os.Getenv("SANDBOX_KATA_TEST") != "1" {
+		b.Skip("needs SANDBOX_K8S_TEST=1 and SANDBOX_KATA_TEST=1")
+	}
+	o := baseOpts("true")
+	o.Backend = "k8s"
+	o.Runtime = "kata"
+	benchColdOneShot(b, o)
+}
