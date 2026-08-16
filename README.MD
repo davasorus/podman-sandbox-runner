@@ -43,6 +43,18 @@ Every run gets:
   (gVisor) or a lightweight VM with its own kernel (Kata) between the
   workload and the host (see Alternate runtimes)
 
+### Seccomp
+
+Containers also run under a seccomp profile. On the docker/podman backends
+this is a bundled default-allow profile that denies 22 syscalls a sandbox
+never needs (`ptrace`, `mount`, `bpf`, module loading, keyring calls,
+`kexec`/`reboot`, and similar) as defense-in-depth atop the dropped
+capabilities. Docker Engine and podman want the profile in different forms
+(inline JSON vs. a file path); the tool detects which daemon it is talking
+to and delivers the right one. If the profile can't be applied it is
+omitted, falling back to the daemon's default seccomp profile — never to
+unconfined. The Kubernetes backend uses the `RuntimeDefault` profile.
+
 ## Usage
 
 ```

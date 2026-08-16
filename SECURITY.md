@@ -40,6 +40,31 @@ Backend-specific caveats (k8s NetworkPolicy enforcement and its startup
 race, `-netwait`, gVisor memory-limit semantics) are documented in the
 README and apply to security assessments.
 
+## Seccomp
+
+Every sandboxed container runs under a seccomp profile in addition to
+`CapDrop: ALL`, `no-new-privileges`, a read-only rootfs, a non-root user,
+and no network:
+
+- **Docker / podman backends** apply a bundled default-allow profile that
+  denies 22 syscalls a sandboxed workload never legitimately needs:
+  `ptrace`, `mount`, `umount2`, `pivot_root`, `reboot`, `kexec_load`,
+  `kexec_file_load`, `init_module`, `finit_module`, `delete_module`,
+  `bpf`, `perf_event_open`, `acct`, `swapon`, `swapoff`, `clock_settime`,
+  `settimeofday`, `add_key`, `request_key`, `keyctl`, `mknod`, `mknodat`.
+  Most are already blocked by dropped capabilities; the profile makes the
+  denials explicit and closes kernel attack surface as defense-in-depth.
+  Docker Engine and podman accept the seccomp option in different forms
+  (inline JSON vs. a file path); the tool detects the daemon and delivers
+  the correct form automatically. If the profile cannot be applied it is
+  omitted rather than failing the run, so the container falls back to the
+  daemon's own default seccomp profile plus dropped capabilities — never
+  to unconfined.
+- **Kubernetes backend** sets the pod's seccomp profile to
+  `RuntimeDefault` (the container runtime's default profile). Shipping the
+  custom denylist on k8s would require deploying the profile file to every
+  node, which is deployment-specific and out of scope for the tool itself.
+
 ## Known accepted vulnerabilities
 
 None currently. Exceptions, when they exist, are tracked in
