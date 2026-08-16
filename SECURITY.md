@@ -17,7 +17,10 @@ container runtime and kernel:
   sandboxed code reach the network, write outside its scratch space,
   escalate privileges, exceed resource limits, or survive cleanup. This
   includes silent downgrades: the tool fails closed when a requested
-  runtime (e.g. gVisor) is not honored by the daemon or cluster.
+  runtime (e.g. gVisor) is not honored by the daemon or cluster. Pool
+  mode's between-run hygiene (process reaping, scratch clearing) is
+  also in scope; its documented same-trust-domain requirement is a
+  design boundary, not a vulnerability.
 - **Out of scope**: kernel and container-runtime escape
   vulnerabilities. Container isolation is kernel-level; if your threat
   model includes hostile kernel exploits, use a stronger boundary. The

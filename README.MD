@@ -109,6 +109,28 @@ res, err := sandbox.Run(ctx, sandbox.Opts{
 `sandbox.Backend` is an interface; `New(opts)` selects the implementation
 from `Opts.Backend`. API documentation is on pkg.go.dev.
 
+## Warm pools (library only)
+
+For latency-sensitive callers making many runs, `sandbox.Pool` keeps a
+holder container warm and executes each run via the exec API — warm
+runs complete in well under a second versus seconds for cold starts:
+
+```go
+pool, err := sandbox.NewPool(ctx, opts)   // opts.Cmd ignored; opts.User required
+defer pool.Close(ctx)
+res, err := pool.Run(ctx, []string{"python3", "-"}, stdin, &out, &errBuf)
+```
+
+**Security tradeoff, stated plainly:** runs in one pool share a
+container. Between runs the pool kills the workload user's processes
+and clears `/work` and `/tmp`, but this hygiene is best-effort — runs
+in one pool must belong to the same trust domain. For mutually
+untrusted callers, use one-shot `Run` or separate pools. The holder
+runs as the image default user with an init process (PID 1 reaping);
+workloads exec as `Opts.User`. If a workload kills the holder (e.g. a
+cgroup-wide OOM), the pool fails closed and reports itself unusable
+rather than silently respawning. Docker/podman backend only.
+
 ## Connection
 
 **docker/podman**: standard Docker client env vars.
