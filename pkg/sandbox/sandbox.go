@@ -70,6 +70,15 @@ type Opts struct {
 	// otherwise.
 	User string
 
+	// Runtime selects an alternate OCI runtime on the docker backend
+	// (e.g. "runsc" for gVisor) or a RuntimeClass name on the k8s
+	// backend (e.g. "gvisor"). Empty uses the backend's default. The
+	// named runtime must be installed and registered on the host or
+	// cluster; runs fail at create time if it isn't. Note: gVisor
+	// (runsc) is incompatible with rootless podman due to cgroup
+	// delegation; use a rootful daemon.
+	Runtime string
+
 	// Binds mounts host files or directories into the container in
 	// "host-path:container-path" form. Mounts are always read-only:
 	// any mode suffix provided is replaced with "ro". Host paths

@@ -49,6 +49,7 @@ func main() {
 	netwait := fs.Duration("netwait", 0, "k8s only: delay start so network policy is enforced first (e.g. 3s)")
 	stdinFlag := fs.Bool("i", false, "pipe stdin into the container")
 	jsonFlag := fs.Bool("json", false, "emit result as JSON instead of streaming")
+	runtime := fs.String("runtime", "", "alternate OCI runtime (docker: e.g. runsc) or RuntimeClass (k8s)")
 	var vols, envs multiFlag
 	fs.Var(&vols, "v", "mount host file/dir read-only: /host/path:/container/path (repeatable)")
 	fs.Var(&envs, "env", "environment variable KEY=VAL (repeatable)")
@@ -89,6 +90,7 @@ func main() {
 		Env:       envs,
 		WithStdin: *stdinFlag,
 		Backend:   *backend,
+		Runtime:   *runtime,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

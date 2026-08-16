@@ -136,3 +136,33 @@ func TestK8sRejectsBinds(t *testing.T) {
 		t.Errorf("want binds-rejected error, got %v", err)
 	}
 }
+
+// TestK8sGvisorRuntime verifies runtime selection end-to-end: it runs
+// only when the cluster has a "gvisor" RuntimeClass (in addition to the
+// SANDBOX_K8S_TEST gate). The assertion is the gVisor sentry kernel
+// appearing in uname output — proof syscalls hit the sentry.
+func TestK8sGvisorRuntime(t *testing.T) {
+	o := k8sOpts(t, "uname", "-a")
+	if os.Getenv("SANDBOX_GVISOR_TEST") != "1" {
+		t.Skip("SANDBOX_GVISOR_TEST != 1; skipping gVisor runtime test")
+	}
+	o.Runtime = "gvisor"
+	_, stdout, err := runK8s(t, o)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !strings.Contains(stdout, "-gvisor") {
+		t.Errorf("uname = %q; want gVisor sentry kernel", stdout)
+	}
+}
+
+// TestK8sRuntimeFailClosed verifies a nonexistent RuntimeClass is
+// rejected at pod admission rather than silently downgraded.
+func TestK8sRuntimeFailClosed(t *testing.T) {
+	o := k8sOpts(t, "echo", "hi")
+	o.Runtime = "nonexistent-runtime-class"
+	_, _, err := runK8s(t, o)
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Errorf("want RuntimeClass-not-found error, got %v", err)
+	}
+}

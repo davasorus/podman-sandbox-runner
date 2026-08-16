@@ -100,6 +100,7 @@ func (k *k8sBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout, s
 			RestartPolicy:                corev1.RestartPolicyNever,
 			AutomountServiceAccountToken: ptr(false),
 			EnableServiceLinks:           ptr(false),
+			RuntimeClassName:             runtimeClassOrNil(o.Runtime),
 			Containers: []corev1.Container{{
 				Name:            "sandbox",
 				Image:           o.Image,
@@ -280,4 +281,11 @@ func ensureIsolationPolicy(ctx context.Context, cs *kubernetes.Clientset, ns str
 		return nil
 	}
 	return err
+}
+
+func runtimeClassOrNil(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }

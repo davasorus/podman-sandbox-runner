@@ -16,8 +16,7 @@ type dockerBackend struct{}
 func (d *dockerBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout, stderr io.Writer) (Result, error) {
 	var res Result
 
-	// NOTE: confirm against `go doc client.New` / `client.FromEnv` output
-	cli, err := client.New(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return res, fmt.Errorf("connecting to socket: %w", err)
 	}
@@ -43,11 +42,12 @@ func (d *dockerBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout
 			AttachStderr: true,
 			AttachStdin:  o.WithStdin,
 			OpenStdin:    o.WithStdin,
-			StdinOnce:    o.WithStdin,
+			StdinOnce:    o.WithStdin, // close container stdin when ours ends
 		},
 		HostConfig: &container.HostConfig{
+			Runtime:        o.Runtime,
 			NetworkMode:    "none",
-			AutoRemove:     false,
+			AutoRemove:     false, // we remove manually in the deferred cleanup
 			ReadonlyRootfs: true,
 			CapDrop:        []string{"ALL"},
 			SecurityOpt:    []string{"no-new-privileges"},
@@ -68,15 +68,28 @@ func (d *dockerBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout
 	}
 	id := created.ID
 
+	// cleanup runs no matter how we exit — fresh context since ctx may be dead
 	defer func() {
 		rmCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		cli.ContainerRemove(rmCtx, id, client.ContainerRemoveOptions{Force: true})
 	}()
 
+	// Podman's Docker-compat API silently ignores HostConfig.Runtime;
+	// a silent downgrade from a requested runtime (e.g. gVisor) is a
+	// security failure, so verify the daemon honored the request.
+	if o.Runtime != "" {
+		insp, err := cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
+		if err != nil {
+			return res, fmt.Errorf("verifying runtime: %w", err)
+		}
+		if got := insp.Container.HostConfig.Runtime; got != o.Runtime {
+			return res, fmt.Errorf("requested runtime %q but daemon assigned %q (podman's compat API ignores HostConfig.Runtime; configure the runtime daemon-side or use a Docker daemon)", o.Runtime, got)
+		}
+	}
+
 	// attach before start so no output is missed
 	att, err := cli.ContainerAttach(ctx, id, client.ContainerAttachOptions{
-		// NOTE: field names pending `go doc client.ContainerAttachOptions`
 		Stream: true,
 		Stdout: true,
 		Stderr: true,
@@ -87,16 +100,18 @@ func (d *dockerBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout
 	}
 	defer att.Close()
 
+	// demux and stream output live
 	outDone := make(chan error, 1)
 	go func() {
 		_, err := stdcopy.StdCopy(stdout, stderr, att.Reader)
 		outDone <- err
 	}()
 
+	// pump stdin if requested
 	if o.WithStdin && stdin != nil {
 		go func() {
 			io.Copy(att.Conn, stdin)
-			att.CloseWrite()
+			att.CloseWrite() // signal EOF to the container
 		}()
 	}
 
@@ -127,12 +142,14 @@ func (d *dockerBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout
 
 	res.DurationMS = time.Since(started).Milliseconds()
 
+	// drain remaining buffered output
 	select {
 	case <-outDone:
 	case <-time.After(2 * time.Second):
 	}
 
-	// OOM flag from inspect
+	// OOM flag from inspect (reflects PID 1 only; exit 137 is the
+	// more reliable signal)
 	if insp, err := cli.ContainerInspect(context.Background(), id, client.ContainerInspectOptions{}); err == nil && insp.Container.State != nil {
 		res.OOMKilled = insp.Container.State.OOMKilled
 	}
