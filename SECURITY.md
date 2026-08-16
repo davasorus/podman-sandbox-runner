@@ -20,7 +20,13 @@ container runtime and kernel:
   runtime (e.g. gVisor) is not honored by the daemon or cluster. Pool
   mode's between-run hygiene (process reaping, scratch clearing) is
   also in scope; its documented same-trust-domain requirement is a
-  design boundary, not a vulnerability.
+  design boundary, not a vulnerability. Daemon mode (`sandbox serve`)
+  executes commands on behalf of any client that can reach its unix
+  socket (mode 0600) or loopback HTTP listener; the HTTP transport is
+  unauthenticated by design and loopback-bound (non-loopback binds are
+  refused without an explicit override flag). Access to either endpoint
+  is equivalent to local sandboxed-command execution and is the
+  operator's responsibility to control — it is not a vulnerability.
 - **Out of scope**: kernel and container-runtime escape
   vulnerabilities. Container isolation is kernel-level; if your threat
   model includes hostile kernel exploits, use a stronger boundary. The
