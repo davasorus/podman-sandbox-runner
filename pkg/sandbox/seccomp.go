@@ -37,12 +37,12 @@ func seccompProfileFile() (string, error) {
 			dir = os.TempDir()
 		}
 		dir = filepath.Join(dir, "podman-sandbox-runner")
-		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
+		if mkErr := os.MkdirAll(dir, 0o700); mkErr != nil {
 			seccompErr = mkErr
 			return
 		}
 		p := filepath.Join(dir, "seccomp.json")
-		if wErr := os.WriteFile(p, []byte(seccompProfileJSON), 0o644); wErr != nil {
+		if wErr := os.WriteFile(p, []byte(seccompProfileJSON), 0o600); wErr != nil {
 			seccompErr = wErr
 			return
 		}
