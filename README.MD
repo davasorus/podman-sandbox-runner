@@ -3,7 +3,7 @@
 Run untrusted commands and code in ephemeral, locked-down containers.
 Pipe code in, get output out — nothing escapes. Supports docker, podman,
 and Kubernetes backends behind one CLI and one Go library, with optional
-gVisor runtime selection.
+gVisor or Kata runtime selection, warm pools, and a pooling daemon.
 
 ```sh
 echo 'print(21 * 2)' | sandbox run -json -i -image docker.io/library/python:3-alpine -- python3 -
@@ -39,13 +39,15 @@ Every run gets:
 - **Hard timeout** (default 30s) — container/pod force-removed on expiry
 - **Guaranteed cleanup** on every exit path, including ctrl-C
 - **k8s extra**: no service account token mounted, no service links
-- **Optional gVisor** — `-runtime` interposes a userspace kernel between
-  the workload and the host (see Alternate runtimes)
+- **Optional gVisor or Kata** — `-runtime` interposes a userspace kernel
+  (gVisor) or a lightweight VM with its own kernel (Kata) between the
+  workload and the host (see Alternate runtimes)
 
 ## Usage
 
 ```
 sandbox run [flags] -- <command...>
+sandbox serve [flags]
 sandbox version
 
   -backend string   auto|docker|k8s (default "auto" = docker API)
@@ -54,15 +56,17 @@ sandbox version
   -mem int          memory limit in MB (default 256)
   -cpus float       CPU limit in cores (default 1)
   -user string      uid:gid (default "65534:65534"); empty = image default
-  -runtime string   alternate OCI runtime (docker backend, e.g. "runsc") or
-                    RuntimeClass name (k8s backend, e.g. "gvisor"); empty
-                    uses the backend default
+  -runtime string   alternate OCI runtime (docker backend, e.g. "runsc",
+                    "kata") or RuntimeClass name (k8s backend, e.g. "gvisor",
+                    "kata"); empty uses the backend default
   -v path:path      mount host file/dir read-only (repeatable; docker/podman only)
   -env KEY=VAL      environment variable (repeatable)
   -i                pipe stdin into the container
   -netwait duration k8s only: init delay so network policy is enforced
                     before the command runs (e.g. 3s; default 0)
   -json             emit structured result instead of streaming
+  -via endpoint     submit to a running daemon instead of executing locally:
+                    unix:///path/to.sock or http://host:port
 ```
 
 Without `-json`, output streams live and the process exit code mirrors
@@ -90,6 +94,9 @@ echo 'print(6*7)' | sandbox run -backend k8s -netwait 3s -json -i -image docker.
 
 # gVisor isolation on kubernetes
 sandbox run -backend k8s -runtime gvisor -- uname -a
+
+# Kata (VM-grade) isolation on kubernetes
+sandbox run -backend k8s -runtime kata -- uname -a
 ```
 
 ## Library use
@@ -109,34 +116,46 @@ res, err := sandbox.Run(ctx, sandbox.Opts{
 `sandbox.Backend` is an interface; `New(opts)` selects the implementation
 from `Opts.Backend`. API documentation is on pkg.go.dev.
 
-## Warm pools (library only)
+## Warm pools (library)
 
-For latency-sensitive callers making many runs, `sandbox.Pool` keeps a
-holder container warm and executes each run via the exec API — warm
-runs complete in well under a second versus seconds for cold starts:
+For latency-sensitive callers making many runs, `sandbox.Pool` keeps
+holders warm and executes each run via the exec API — warm runs complete
+in well under a second versus seconds for cold starts. The pool
+autoscales: it keeps `Min` holders warm, grows on demand up to `Max`, and
+closes idle holders (down to `Min`) after `IdleTimeout`.
 
 ```go
-pool, err := sandbox.NewPool(ctx, opts)   // opts.Cmd ignored; opts.User required
+pool, err := sandbox.NewPool(ctx, opts, sandbox.PoolConfig{
+    Min: 1, Max: 8, IdleTimeout: 5 * time.Minute,
+})
 defer pool.Close(ctx)
 res, err := pool.Run(ctx, []string{"python3", "-"}, stdin, &out, &errBuf)
 ```
 
-**Security tradeoff, stated plainly:** runs in one pool share a
-container. Between runs the pool kills the workload user's processes
-and clears `/work` and `/tmp`, but this hygiene is best-effort — runs
-in one pool must belong to the same trust domain. For mutually
-untrusted callers, use one-shot `Run` or separate pools. The holder
-runs as the image default user with an init process (PID 1 reaping);
-workloads exec as `Opts.User`. If a workload kills the holder (e.g. a
-cgroup-wide OOM), the pool fails closed and reports itself unusable
-rather than silently respawning. Docker/podman backend only.
+`opts.Cmd` is ignored (each `Run` supplies its own command); `opts.User`
+is required (workloads exec as this user); `opts.Timeout` applies per run.
+Runs are serialized per holder and dispatched across holders concurrently;
+for more concurrency raise `Max`.
+
+**Security tradeoff, stated plainly:** runs sharing one holder share a
+container. Between runs the pool kills the workload user's processes and
+clears `/work` and `/tmp`, but this hygiene is best-effort — runs on one
+holder must belong to the same trust domain. For mutually untrusted
+callers, use one-shot `Run` or separate pools. The holder runs an init
+(PID 1 reaping); workloads exec as `Opts.User`. If a workload kills its
+holder (e.g. a cgroup-wide OOM), that holder is dropped and, if demand
+requires, replaced by a fresh one — a dead holder is never reused. On the
+k8s backend, between-run process reaping is enumeration-based (holder and
+workload share a uid) and could in principle be raced by a fork-storm; the
+pids limit bounds that. The docker backend reaps atomically.
 
 ## Daemon mode (`sandbox serve`)
 
 Warm pools live only inside one process, so per-invocation CLI runs can't
 share them. `sandbox serve` runs a long-lived daemon that holds an
 autoscaling pool and executes runs submitted over a unix socket and/or a
-loopback HTTP listener — giving CLI and other clients persistent warmth.
+loopback HTTP listener — giving the CLI and other clients persistent
+warmth.
 
 ```sh
 # start a daemon: 1 warm holder, up to 4 under load, close idle after 5m
@@ -153,21 +172,21 @@ sandbox run -via unix:///run/user/$UID/sandbox.sock -- python3 -c 'print(6*7)'
 sandbox run -via http://127.0.0.1:8099 -i -- cat < input.txt
 ```
 
-Or over HTTP directly (`POST /run`, JSON body; stdout/stderr are
+Over HTTP directly (`POST /run`, JSON body; `stdout`/`stderr` are
 base64-encoded in the JSON response):
 
 ```sh
 curl -s -X POST http://127.0.0.1:8099/run -d '{"cmd":["echo","hi"]}'
 ```
 
-Or from Go, via the library client:
+From Go, via the library client:
 
 ```go
 resp, err := sandbox.Submit(ctx, "unix:///run/user/1000/sandbox.sock",
     sandbox.RunRequest{Cmd: []string{"echo", "hi"}})
 ```
 
-Pool flags: `-min` (warm floor, 0 allows scale-to-zero), `-max` (ceiling),
+Pool flags: `-min` (warm floor; 0 allows scale-to-zero), `-max` (ceiling),
 `-idle` (close idle holders after this; 0 = never). Sandbox flags
 (`-image`, `-mem`, `-cpus`, `-user`, `-runtime`, `-backend`, ...) apply to
 every run the daemon executes and are fixed for the daemon's lifetime.
@@ -175,7 +194,7 @@ every run the daemon executes and are fixed for the daemon's lifetime.
 **Security:** the daemon executes untrusted commands on behalf of anyone
 who can reach its socket or port.
 
-- The **unix socket** is created mode 0600 (owner-only) — this is the
+- The **unix socket** is created mode 0600 (owner-only) — that is the
   access control; keep it in a directory only you can reach.
 - The **HTTP listener has no authentication**. It binds loopback only;
   `serve` refuses a non-loopback `-http` bind unless `-http-allow-remote`
@@ -183,48 +202,50 @@ who can reach its socket or port.
   ability to run arbitrary sandboxed commands. There is no TLS — do not
   expose it beyond localhost.
 
-## Connection
-
-**docker/podman**: standard Docker client env vars.
-
-```sh
-# rootless podman on Linux
-export DOCKER_HOST=unix:///run/user/$UID/podman/podman.sock
-```
-
-On Windows with a running podman machine, the client defaults to the
-`docker_engine` named pipe — runs land on the machine.
-
-**k8s**: `KUBECONFIG`, falling back to `~/.kube/config`, falling back to
-in-cluster config. Pods are created in `default` or `$SANDBOX_NAMESPACE`.
-
-## Alternate runtimes (gVisor)
+## Alternate runtimes (gVisor, Kata)
 
 `-runtime` selects a stronger isolation runtime where the backend
-supports it, upgrading the "not a VM" caveat into an option:
+supports it, upgrading the "not a VM" caveat into an option. Two are
+verified against k3s:
+
+- **gVisor** (`runsc`) — a userspace kernel (the "sentry") that
+  intercepts guest syscalls. Lighter than a VM; the guest reports the
+  gVisor sentry kernel.
+- **Kata** (`kata`) — a lightweight VM with its own real Linux kernel per
+  container. Heaviest isolation short of a full VM; the guest reports a
+  distinct guest kernel version, not the host's.
 
 ```sh
-# k8s with a "gvisor" RuntimeClass installed (runsc + containerd shim)
+# gVisor: k8s with a "gvisor" RuntimeClass (runsc + containerd shim)
 sandbox run -backend k8s -runtime gvisor -- uname -a
 # Linux ... 4.19.0-gvisor ...   <- syscalls served by the gVisor sentry
+
+# Kata: k8s with a "kata" RuntimeClass (kata-static + containerd shim)
+sandbox run -backend k8s -runtime kata -- uname -r
+# 6.x.y  <- a Kata guest kernel, distinct from the host kernel
 ```
 
-Behavior and caveats, verified against k3s + runsc:
+Behavior and caveats, verified against k3s:
 
 - **Fail-closed everywhere.** On k8s, a nonexistent RuntimeClass is
   rejected at pod admission. On the docker backend, the tool inspects
   the created container and errors if the daemon did not honor the
   requested runtime — because **podman's Docker-compat API silently
-  ignores `HostConfig.Runtime`**, and a silent downgrade from gVisor to
-  runc would be a security failure. Podman users who want gVisor must
+  ignores `HostConfig.Runtime`**, and a silent downgrade to runc would
+  be a security failure. Podman users who want gVisor/Kata must
   configure it daemon-side; note also that **rootless podman cannot run
   runsc at all** (cgroup delegation), so a rootful daemon is required.
-- **Memory limits behave differently under gVisor.** Exceeding the
-  limit may stall the workload rather than OOM-kill it: no exit 137, no
+- **gVisor memory limits behave differently.** Exceeding the limit may
+  stall the workload rather than OOM-kill it: no exit 137, no
   `oom_killed`, the process hangs. Always set a `-timeout` — under
-  gVisor it is the effective resource backstop.
-- NetworkPolicy isolation applies to gVisor pods the same as native
-  ones (verified).
+  gVisor it is the effective resource backstop. (Kata, running a real
+  kernel, OOM-kills normally.)
+- **Kata requires host virtualization.** It boots a real VM per
+  container, so the host needs KVM (`/dev/kvm`) and, in nested setups
+  (e.g. WSL2), nested virtualization enabled. `kata-runtime check`
+  reports host readiness. Where KVM is unavailable, Kata cannot run.
+- NetworkPolicy isolation applies to gVisor and Kata pods the same as
+  native ones (verified).
 - The RuntimeClass/runtime must be installed on the cluster or host;
   this tool does not install it.
 
@@ -262,9 +283,9 @@ Read these before pointing the k8s backend at hostile code.
 - Image pulls happen implicitly on first use; pull errors are ignored so
   local-only images work — a typo'd image surfaces as a create error.
   On k8s, pulls happen in the kubelet with no progress output.
-- Not a VM. Container isolation is kernel-level; hostile-kernel-exploit
-  threat models need a stronger boundary (gVisor via `-runtime`, Kata,
-  or a real VM).
+- Not a VM by default. Plain container isolation is kernel-level; for
+  hostile-kernel-exploit threat models use a stronger boundary via
+  `-runtime` (gVisor's userspace kernel, or Kata's real VM kernel).
 
 ## Development
 
@@ -275,8 +296,10 @@ go test -v -timeout 300s ./...     # docker-backend suite; needs a docker/podman
 
 The suite covers both backends: the docker-backend tests run against
 Docker on GitHub runners, and the k8s-backend tests run against a k3s
-cluster installed in CI — including gVisor, which CI installs (runsc +
+cluster installed in CI — including gVisor and Kata, which CI installs
+(gVisor: runsc + containerd shim + RuntimeClass; Kata: kata-static +
 containerd shim + RuntimeClass) and exercises. The k8s tests are gated
-behind `SANDBOX_K8S_TEST=1`; the gVisor runtime test additionally
-behind `SANDBOX_GVISOR_TEST=1`, requiring a `gvisor` RuntimeClass on
-whatever cluster runs them.
+behind `SANDBOX_K8S_TEST=1`; the gVisor runtime test additionally behind
+`SANDBOX_GVISOR_TEST=1` and the Kata test behind `SANDBOX_KATA_TEST=1`,
+each requiring the corresponding RuntimeClass on whatever cluster runs
+them (Kata additionally requires host KVM).
