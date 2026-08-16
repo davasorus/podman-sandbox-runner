@@ -1,5 +1,3 @@
 # Vulnerabilities assessed as not applicable — rationale in SECURITY.md.
-# GO-2026-4887: Moby AuthZ plugin bypass — daemon-side plugin validation; this tool is an API client only.
-# GO-2026-4883: Moby plugin privilege off-by-one — daemon-side; no fixed client release exists (Fixed in: N/A).
-GO-2026-4887
-GO-2026-4883
+# Currently empty. Entries here are CI-enforced exceptions: govulncheck
+# findings not listed below fail the build.

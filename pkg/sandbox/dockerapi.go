@@ -6,10 +6,9 @@ import (
 	"io"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	imagetypes "github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 )
 
 type dockerBackend struct{}
@@ -17,23 +16,24 @@ type dockerBackend struct{}
 func (d *dockerBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout, stderr io.Writer) (Result, error) {
 	var res Result
 
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	// NOTE: confirm against `go doc client.New` / `client.FromEnv` output
+	cli, err := client.New(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return res, fmt.Errorf("connecting to socket: %w", err)
 	}
 	defer cli.Close()
 
 	// pull if not local; errors ignored so local-only images work
-	if _, _, err := cli.ImageInspectWithRaw(ctx, o.Image); err != nil {
+	if _, err := cli.ImageInspect(ctx, o.Image); err != nil {
 		fmt.Fprintf(stderr, "pulling %s...\n", o.Image)
-		if rc, err := cli.ImagePull(ctx, o.Image, imagetypes.PullOptions{}); err == nil {
-			io.Copy(io.Discard, rc)
-			rc.Close()
+		if resp, err := cli.ImagePull(ctx, o.Image, client.ImagePullOptions{}); err == nil {
+			io.Copy(io.Discard, resp)
+			resp.Close()
 		}
 	}
 
-	resp, err := cli.ContainerCreate(ctx,
-		&container.Config{
+	created, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config: &container.Config{
 			Image:        o.Image,
 			Cmd:          o.Cmd,
 			Env:          o.Env,
@@ -45,7 +45,7 @@ func (d *dockerBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout
 			OpenStdin:    o.WithStdin,
 			StdinOnce:    o.WithStdin,
 		},
-		&container.HostConfig{
+		HostConfig: &container.HostConfig{
 			NetworkMode:    "none",
 			AutoRemove:     false,
 			ReadonlyRootfs: true,
@@ -62,19 +62,21 @@ func (d *dockerBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout
 				PidsLimit: ptr(int64(128)),
 			},
 		},
-		nil, nil, "")
+	})
 	if err != nil {
 		return res, fmt.Errorf("create: %w", err)
 	}
-	id := resp.ID
+	id := created.ID
 
 	defer func() {
 		rmCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		cli.ContainerRemove(rmCtx, id, container.RemoveOptions{Force: true})
+		cli.ContainerRemove(rmCtx, id, client.ContainerRemoveOptions{Force: true})
 	}()
 
-	att, err := cli.ContainerAttach(ctx, id, container.AttachOptions{
+	// attach before start so no output is missed
+	att, err := cli.ContainerAttach(ctx, id, client.ContainerAttachOptions{
+		// NOTE: field names pending `go doc client.ContainerAttachOptions`
 		Stream: true,
 		Stdout: true,
 		Stderr: true,
@@ -100,19 +102,21 @@ func (d *dockerBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout
 
 	started := time.Now()
 
-	if err := cli.ContainerStart(ctx, id, container.StartOptions{}); err != nil {
+	if _, err := cli.ContainerStart(ctx, id, client.ContainerStartOptions{}); err != nil {
 		return res, fmt.Errorf("start: %w", err)
 	}
 
 	runCtx, cancel := context.WithTimeout(ctx, o.Timeout)
 	defer cancel()
 
-	waitCh, errCh := cli.ContainerWait(runCtx, id, container.WaitConditionNotRunning)
+	wait := cli.ContainerWait(runCtx, id, client.ContainerWaitOptions{
+		Condition: container.WaitConditionNotRunning,
+	})
 
 	select {
-	case w := <-waitCh:
+	case w := <-wait.Result:
 		res.ExitCode = int(w.StatusCode)
-	case err := <-errCh:
+	case err := <-wait.Error:
 		if runCtx.Err() != nil {
 			res.TimedOut = true
 			res.DurationMS = time.Since(started).Milliseconds()
@@ -128,8 +132,9 @@ func (d *dockerBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout
 	case <-time.After(2 * time.Second):
 	}
 
-	if insp, err := cli.ContainerInspect(context.Background(), id); err == nil && insp.State != nil {
-		res.OOMKilled = insp.State.OOMKilled
+	// OOM flag from inspect
+	if insp, err := cli.ContainerInspect(context.Background(), id, client.ContainerInspectOptions{}); err == nil && insp.Container.State != nil {
+		res.OOMKilled = insp.Container.State.OOMKilled
 	}
 
 	return res, nil
