@@ -5,128 +5,76 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"time"
-
-	"github.com/moby/moby/api/pkg/stdcopy"
-	"github.com/moby/moby/api/types/container"
-	"github.com/moby/moby/client"
 )
 
-// Pool keeps a single warm holder container alive and executes runs
-// inside it via the exec API, trading inter-run isolation for latency.
+// Pool keeps a warm holder alive and executes runs inside it via the
+// backend's exec mechanism, trading inter-run isolation for latency.
 //
 // SECURITY TRADEOFF: unlike one-shot Run, consecutive runs in a pool
-// share a container. Between runs the pool kills the workload user's
-// processes and clears /work and /tmp, but this cleanup is best-effort:
-// runs in one pool must belong to the same trust domain. For mutually
-// untrusted callers, use one-shot Run or separate pools.
+// share a container/pod. Between runs the pool reaps workload
+// processes and clears /work and /tmp, but this hygiene is
+// best-effort: runs in one pool must belong to the same trust domain.
+// For mutually untrusted callers, use one-shot Run or separate pools.
 //
-// The holder process runs as the image's default user; workloads exec
-// as Opts.User (nobody by default), which is what allows the root-side
-// cleanup to reap them. Opts.User must therefore be non-empty and
-// different from the image default for the isolation split to hold.
+// Hygiene differs by backend. The docker backend reaps atomically
+// (kill broadcast as the workload uid, which cannot touch the
+// root-side holder). The k8s backend has no per-exec user, so holder
+// and workload share a uid and reaping is enumeration-based — a
+// hostile fork-storm could theoretically race it; the pids limit
+// bounds that race. See the README for the full comparison.
 //
 // Runs are serialized: Pool.Run holds an internal mutex. For
 // concurrency, create multiple pools.
 //
-// Only the docker backend is supported. Opts.Cmd is ignored (each Run
-// supplies its own command); Opts.Timeout applies per run.
+// Opts.Cmd is ignored (each Run supplies its own command);
+// Opts.Timeout applies per run. On k8s, Opts.NetWait is applied once
+// at pool creation.
 type Pool struct {
 	mu     sync.Mutex
-	cli    *client.Client
-	id     string // holder container ID
+	impl   poolImpl
 	opts   Opts
-	broken error // set permanently if the holder dies
+	broken error
 	closed bool
 }
 
-// NewPool creates and starts the holder container. The caller must
-// Close the pool to remove it.
-func NewPool(ctx context.Context, o Opts) (*Pool, error) {
-	switch o.Backend {
-	case "", "auto", "docker":
-	default:
-		return nil, fmt.Errorf("pool: backend %q not supported (docker only)", o.Backend)
-	}
-	if o.User == "" {
-		return nil, fmt.Errorf("pool: Opts.User must be set (workloads exec as this user; the holder runs as the image default)")
-	}
-
-	cli, err := client.New(client.FromEnv)
-	if err != nil {
-		return nil, fmt.Errorf("pool: connecting to socket: %w", err)
-	}
-
-	// pull if not local; errors ignored so local-only images work
-	if _, err := cli.ImageInspect(ctx, o.Image); err != nil {
-		if resp, err := cli.ImagePull(ctx, o.Image, client.ImagePullOptions{}); err == nil {
-			_, _ = io.Copy(io.Discard, resp)
-			_ = resp.Close()
-		}
-	}
-
-	created, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
-		Config: &container.Config{
-			Image: o.Image,
-			// holder: image-default user, sleeps forever; workloads
-			// exec as o.User so root-side cleanup can reap them
-			Cmd:        []string{"sleep", "infinity"},
-			WorkingDir: "/work",
-		},
-		HostConfig: &container.HostConfig{
-			Runtime:        o.Runtime,
-			NetworkMode:    "none",
-			AutoRemove:     false,
-			ReadonlyRootfs: true,
-			Init:           ptr(true),
-			CapDrop:        []string{"ALL"},
-			SecurityOpt:    []string{"no-new-privileges"},
-			Binds:          o.Binds,
-			Tmpfs: map[string]string{
-				"/work": "rw,size=64m,mode=1777",
-				"/tmp":  "rw,size=16m,mode=1777",
-			},
-			Resources: container.Resources{
-				Memory:    o.MemMB * 1024 * 1024,
-				NanoCPUs:  int64(o.CPUs * 1e9),
-				PidsLimit: ptr(int64(128)),
-			},
-		},
-	})
-	if err != nil {
-		_ = cli.Close()
-		return nil, fmt.Errorf("pool: create holder: %w", err)
-	}
-	id := created.ID
-
-	fail := func(e error) (*Pool, error) {
-		rmCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_, _ = cli.ContainerRemove(rmCtx, id, client.ContainerRemoveOptions{Force: true})
-		_ = cli.Close()
-		return nil, e
-	}
-
-	// runtime fail-closed check, same rationale as the one-shot backend
-	if o.Runtime != "" {
-		insp, err := cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
-		if err != nil {
-			return fail(fmt.Errorf("pool: verifying runtime: %w", err))
-		}
-		if got := insp.Container.HostConfig.Runtime; got != o.Runtime {
-			return fail(fmt.Errorf("pool: requested runtime %q but daemon assigned %q", o.Runtime, got))
-		}
-	}
-
-	if _, err := cli.ContainerStart(ctx, id, client.ContainerStartOptions{}); err != nil {
-		return fail(fmt.Errorf("pool: start holder: %w", err))
-	}
-
-	return &Pool{cli: cli, id: id, opts: o}, nil
+// poolImpl is the per-backend pool machinery. All methods are called
+// under Pool.mu.
+type poolImpl interface {
+	// run executes cmd in the holder; it owns per-run timeout handling
+	// and returns TimedOut in the Result when applicable.
+	run(ctx context.Context, cmd []string, stdin io.Reader, stdout, stderr io.Writer) (Result, error)
+	// cleanup reaps workload processes and clears scratch. Best-effort.
+	cleanup()
+	// checkHolder returns an error if the holder is no longer usable.
+	checkHolder() error
+	// close removes the holder and releases resources. Idempotent.
+	close(ctx context.Context) error
 }
 
-// Run executes cmd in the warm holder and returns when it exits or
-// Opts.Timeout expires. Runs are serialized. stdin may be nil.
+// NewPool creates and starts the holder for the backend selected by
+// o.Backend. The caller must Close the pool to remove it.
+func NewPool(ctx context.Context, o Opts) (*Pool, error) {
+	if o.User == "" {
+		return nil, fmt.Errorf("pool: Opts.User must be set")
+	}
+	var impl poolImpl
+	var err error
+	switch o.Backend {
+	case "", "auto", "docker":
+		impl, err = newDockerPool(ctx, o)
+	case "k8s":
+		impl, err = newK8sPool(ctx, o)
+	default:
+		return nil, fmt.Errorf("pool: unknown backend %q", o.Backend)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &Pool{impl: impl, opts: o}, nil
+}
+
+// Run executes cmd in the warm holder. Runs are serialized. stdin may
+// be nil.
 func (p *Pool) Run(ctx context.Context, cmd []string, stdin io.Reader, stdout, stderr io.Writer) (Result, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -139,128 +87,20 @@ func (p *Pool) Run(ctx context.Context, cmd []string, stdin io.Reader, stdout, s
 		return res, fmt.Errorf("pool: unusable: %w", p.broken)
 	}
 
-	runCtx, cancel := context.WithTimeout(ctx, p.opts.Timeout)
-	defer cancel()
+	res, runErr := p.impl.run(ctx, cmd, stdin, stdout, stderr)
 
-	withStdin := stdin != nil
-
-	ec, err := p.cli.ExecCreate(runCtx, p.id, client.ExecCreateOptions{
-		User:         p.opts.User,
-		Cmd:          cmd,
-		Env:          p.opts.Env,
-		WorkingDir:   "/work",
-		AttachStdout: true,
-		AttachStderr: true,
-		AttachStdin:  withStdin,
-	})
-	if err != nil {
-		return res, fmt.Errorf("pool: exec create: %w", err)
-	}
-
-	// Attaching to an exec starts it (classic Docker API semantics).
-	att, err := p.cli.ExecAttach(runCtx, ec.ID, client.ExecAttachOptions{})
-	if err != nil {
-		return res, fmt.Errorf("pool: exec attach: %w", err)
-	}
-	defer att.Close()
-
-	started := time.Now()
-
-	outDone := make(chan error, 1)
-	go func() {
-		_, err := stdcopy.StdCopy(stdout, stderr, att.Reader)
-		outDone <- err
-	}()
-
-	if withStdin {
-		go func() {
-			_, _ = io.Copy(att.Conn, stdin)
-			_ = att.CloseWrite()
-		}()
-	}
-
-	// the stream closing is the exec finishing (or the context dying)
-	select {
-	case <-outDone:
-	case <-runCtx.Done():
-	}
-	res.DurationMS = time.Since(started).Milliseconds()
-
-	if runCtx.Err() != nil {
-		res.TimedOut = true
-		// reap the runaway workload so the pool stays usable
-		p.cleanup()
-		if err := p.checkHolder(); err != nil {
-			p.broken = err
-		}
-		return res, fmt.Errorf("pool: timed out after %s (workload killed)", p.opts.Timeout)
-	}
-
-	insp, err := p.cli.ExecInspect(context.Background(), ec.ID, client.ExecInspectOptions{})
-	if err != nil {
-		return res, fmt.Errorf("pool: exec inspect: %w", err)
-	}
-	res.ExitCode = insp.ExitCode
-	if res.ExitCode == 137 {
-		res.OOMKilled = true // heuristic, same caveat as elsewhere
-	}
-
-	// between-runs hygiene: reap workload processes, clear scratch
-	p.cleanup()
-
-	// an OOM or hostile workload can take the holder down with it;
-	// fail closed rather than silently respawning
-	if err := p.checkHolder(); err != nil {
+	// between-runs hygiene, then fail closed if the holder died
+	p.impl.cleanup()
+	if err := p.impl.checkHolder(); err != nil {
 		p.broken = err
-		return res, fmt.Errorf("pool: %w (create a new pool)", err)
+		if runErr == nil {
+			runErr = fmt.Errorf("pool: %w (create a new pool)", err)
+		}
 	}
-
-	return res, nil
+	return res, runErr
 }
 
-// cleanup clears scratch space and reaps the workload user's processes.
-// It runs AS the workload user: a uid can always signal its own
-// processes (no CAP_KILL needed — we drop all capabilities, so a
-// root-side reap would be powerless against another uid). `kill -9 -1`
-// kills everything the workload uid can signal, including this cleanup
-// shell itself last — its exit code is meaningless and ignored.
-// Best-effort by design; the holder-liveness check is the backstop.
-func (p *Pool) cleanup() {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	ec, err := p.cli.ExecCreate(ctx, p.id, client.ExecCreateOptions{
-		User:         p.opts.User,
-		Cmd:          []string{"sh", "-c", "rm -rf /work/* /tmp/* 2>/dev/null; kill -9 -1"},
-		AttachStdout: true,
-		AttachStderr: true,
-	})
-	if err != nil {
-		return
-	}
-	att, err := p.cli.ExecAttach(ctx, ec.ID, client.ExecAttachOptions{})
-	if err != nil {
-		return
-	}
-	defer att.Close()
-	_, _ = io.Copy(io.Discard, att.Reader) // TEMP: was io.Copy(io.Discard, ...
-}
-
-// checkHolder verifies the holder container is still running.
-func (p *Pool) checkHolder() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	insp, err := p.cli.ContainerInspect(ctx, p.id, client.ContainerInspectOptions{})
-	if err != nil {
-		return fmt.Errorf("holder inspect failed: %w", err)
-	}
-	if insp.Container.State == nil || !insp.Container.State.Running {
-		return fmt.Errorf("holder died (possibly OOM-killed by a workload)")
-	}
-	return nil
-}
-
-// Close removes the holder container. Idempotent.
+// Close removes the holder. Idempotent.
 func (p *Pool) Close(ctx context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -268,9 +108,5 @@ func (p *Pool) Close(ctx context.Context) error {
 		return nil
 	}
 	p.closed = true
-	rmCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	_, err := p.cli.ContainerRemove(rmCtx, p.id, client.ContainerRemoveOptions{Force: true})
-	_ = p.cli.Close()
-	return err
+	return p.impl.close(ctx)
 }

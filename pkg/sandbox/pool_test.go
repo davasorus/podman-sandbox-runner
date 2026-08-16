@@ -3,6 +3,7 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -143,5 +144,96 @@ func TestPoolClosedRejectsRuns(t *testing.T) {
 	_ = p.Close(context.Background())
 	if _, _, _, err := poolRun(t, p, "echo", "hi"); err == nil {
 		t.Error("run on closed pool succeeded; want error")
+	}
+}
+
+func newTestK8sPool(t *testing.T) *Pool {
+	t.Helper()
+	if os.Getenv("SANDBOX_K8S_TEST") != "1" {
+		t.Skip("SANDBOX_K8S_TEST != 1; skipping k8s pool test")
+	}
+	o := Opts{
+		Backend: "k8s",
+		Image:   testImage,
+		Timeout: 60 * time.Second,
+		MemMB:   256,
+		CPUs:    1.0,
+		User:    "65534:65534",
+	}
+	p, err := NewPool(context.Background(), o)
+	if err != nil {
+		t.Fatalf("NewPool(k8s): %v", err)
+	}
+	t.Cleanup(func() { _ = p.Close(context.Background()) })
+	return p
+}
+
+func TestK8sPoolBasicAndReuse(t *testing.T) {
+	p := newTestK8sPool(t)
+
+	_, stdout, _, err := poolRun(t, p, "echo", "hello")
+	if err != nil {
+		t.Fatalf("run 1: %v", err)
+	}
+	if strings.TrimSpace(stdout) != "hello" {
+		t.Fatalf("run 1 stdout = %q", stdout)
+	}
+
+	res, stdout, _, err := poolRun(t, p, "echo", "again")
+	if err != nil {
+		t.Fatalf("run 2: %v", err)
+	}
+	if strings.TrimSpace(stdout) != "again" {
+		t.Fatalf("run 2 stdout = %q", stdout)
+	}
+	// warm exec into a running pod should be quick (no pod creation)
+	if res.DurationMS > 5000 {
+		t.Errorf("warm k8s run took %dms; expected well under pod-create time", res.DurationMS)
+	}
+}
+
+func TestK8sPoolStreamSeparationAndExitCode(t *testing.T) {
+	p := newTestK8sPool(t)
+	res, stdout, stderr, err := poolRun(t, p, "sh", "-c", "echo out; echo err >&2; exit 3")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.ExitCode != 3 {
+		t.Errorf("exit = %d, want 3", res.ExitCode)
+	}
+	if strings.TrimSpace(stdout) != "out" || strings.TrimSpace(stderr) != "err" {
+		t.Errorf("streams = %q / %q", stdout, stderr)
+	}
+}
+
+func TestK8sPoolScratchWipedBetweenRuns(t *testing.T) {
+	p := newTestK8sPool(t)
+	if _, _, _, err := poolRun(t, p, "sh", "-c", "echo secret > /work/leftover"); err != nil {
+		t.Fatalf("write run: %v", err)
+	}
+	_, stdout, _, err := poolRun(t, p, "sh", "-c", "ls -A /work | wc -l")
+	if err != nil {
+		t.Fatalf("check run: %v", err)
+	}
+	if strings.TrimSpace(stdout) != "0" {
+		t.Errorf("/work not wiped between runs: %q", stdout)
+	}
+}
+
+func TestK8sPoolBackgroundProcessReaped(t *testing.T) {
+	p := newTestK8sPool(t)
+	if _, _, _, err := poolRun(t, p, "sh", "-c", "sleep 300 & echo spawned"); err != nil {
+		t.Fatalf("spawn run: %v", err)
+	}
+	_, stdout, _, err := poolRun(t, p, "sh", "-c", "pgrep sleep | wc -l")
+	if err != nil {
+		t.Fatalf("check run: %v", err)
+	}
+	// enumeration-based reap: the backgrounded sleep must be gone.
+	// (the holder's own PID 1 is "sleep infinity" but pgrep in the
+	// workload's mount/pid namespace sees pod PIDs; the 300s sleep is
+	// what we assert against — expect it reaped)
+	if strings.TrimSpace(stdout) != "1" {
+		t.Errorf("sleep count = %q after reap; want 1 (holder's sleep infinity only)", stdout)
 	}
 }
