@@ -155,6 +155,4 @@ go build -o sandbox ./cmd/sandbox
 go test -v -timeout 300s ./...     # integration tests; needs a docker/podman socket
 ```
 
-The 10-test suite exercises the docker backend's full security envelope
-and runs in CI against Docker on GitHub runners. The k8s backend is
-verified manually against k3s; it has no CI coverage yet.
+The suite covers both backends: 10 docker-backend tests run against Docker on GitHub runners, and 9 k8s-backend tests run against a k3s cluster installed in CI. The k8s tests are gated behind SANDBOX_K8S_TEST=1 — set it locally to run them against your own cluster.
