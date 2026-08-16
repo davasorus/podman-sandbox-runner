@@ -72,3 +72,23 @@ func BenchmarkWarmPool_Docker(b *testing.B) {
 	o.Backend = "docker"
 	benchWarmPool(b, o)
 }
+
+// --- k8s backend ---
+
+func BenchmarkColdOneShot_K8s(b *testing.B) {
+	if os.Getenv("SANDBOX_K8S_TEST") != "1" {
+		b.Skip("SANDBOX_K8S_TEST != 1; skipping k8s benchmark")
+	}
+	o := baseOpts("true")
+	o.Backend = "k8s"
+	benchColdOneShot(b, o)
+}
+
+func BenchmarkWarmPool_K8s(b *testing.B) {
+	if os.Getenv("SANDBOX_K8S_TEST") != "1" {
+		b.Skip("SANDBOX_K8S_TEST != 1; skipping k8s benchmark")
+	}
+	o := baseOpts()
+	o.Backend = "k8s"
+	benchWarmPool(b, o)
+}
