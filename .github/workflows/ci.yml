@@ -107,6 +107,10 @@ jobs:
       - name: Create gvisor RuntimeClass and smoke-test
         run: |
           printf 'apiVersion: node.k8s.io/v1\nkind: RuntimeClass\nmetadata:\n  name: gvisor\nhandler: runsc\n' | sudo k3s kubectl apply -f -
+          for i in $(seq 1 30); do
+            sudo k3s kubectl get serviceaccount default -n default > /dev/null 2>&1 && break
+            sleep 2
+          done
           sudo k3s kubectl run gvisor-probe --restart=Never --image=alpine --overrides='{"spec":{"runtimeClassName":"gvisor"}}' -- uname -a
           for i in $(seq 1 30); do
             PHASE=$(sudo k3s kubectl get pod gvisor-probe -o jsonpath='{.status.phase}')
