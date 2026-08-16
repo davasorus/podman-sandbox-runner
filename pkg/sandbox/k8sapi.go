@@ -185,13 +185,23 @@ func (k *k8sBackend) Run(ctx context.Context, o Opts, stdin io.Reader, stdout, s
 		return res, fmt.Errorf("executor: %w", err)
 	}
 
+	// client-go's stream-copy goroutines can outlive StreamWithContext on the
+	// timeout/cancel path (no handle to join them). Wrap the caller's writers
+	// so a late write after we return is dropped rather than racing the
+	// caller's read of the same buffer. Close as soon as the stream returns.
+	swOut := newSyncWriter(stdout)
+	swErr := newSyncWriter(stderr)
+
 	started := time.Now()
 
 	streamErr := executor.StreamWithContext(runCtx, remotecommand.StreamOptions{
 		Stdin:  stdin,
-		Stdout: stdout,
-		Stderr: stderr,
+		Stdout: swOut,
+		Stderr: swErr,
 	})
+
+	swOut.Close()
+	swErr.Close()
 
 	res.DurationMS = time.Since(started).Milliseconds()
 

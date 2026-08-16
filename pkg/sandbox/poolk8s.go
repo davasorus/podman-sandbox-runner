@@ -148,9 +148,19 @@ func (k *k8sPool) exec(ctx context.Context, cmd []string, stdin io.Reader, stdou
 	if err != nil {
 		return fmt.Errorf("executor: %w", err)
 	}
-	return executor.StreamWithContext(ctx, remotecommand.StreamOptions{
-		Stdin: stdin, Stdout: stdout, Stderr: stderr,
+
+	// client-go's stream-copy goroutines can outlive StreamWithContext on the
+	// timeout/cancel path (no handle to join them). Wrap the caller's writers
+	// so a late write after this returns is dropped rather than racing the
+	// caller's read of the same buffer. Close as soon as the stream returns.
+	swOut := newSyncWriter(stdout)
+	swErr := newSyncWriter(stderr)
+	streamErr := executor.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdin: stdin, Stdout: swOut, Stderr: swErr,
 	})
+	swOut.Close()
+	swErr.Close()
+	return streamErr
 }
 
 func (k *k8sPool) run(ctx context.Context, cmd []string, stdin io.Reader, stdout, stderr io.Writer) (Result, error) {

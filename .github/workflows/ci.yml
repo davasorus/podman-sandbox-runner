@@ -55,7 +55,7 @@ jobs:
           go-version-file: go.mod
       - run: go vet ./...
       - run: go build ./...
-      - run: go test -v -timeout 300s ./...
+      - run: go test -race -cover -v -timeout 300s ./...
 
   test-k8s:
     needs: lint
@@ -171,4 +171,4 @@ jobs:
           SANDBOX_GVISOR_TEST: "1"
           SANDBOX_KATA_TEST: "1"
           KUBECONFIG: /etc/rancher/k3s/k3s.yaml
-        run: go test -v -timeout 600s -run 'TestK8s' ./pkg/sandbox/
+        run: go test -race -v -timeout 600s -run 'TestK8s' ./pkg/sandbox/
