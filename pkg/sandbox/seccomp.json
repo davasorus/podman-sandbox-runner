@@ -1,0 +1,43 @@
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "archMap": [
+    {
+      "architecture": "SCMP_ARCH_X86_64",
+      "subArchitectures": ["SCMP_ARCH_X86", "SCMP_ARCH_X32"]
+    },
+    {
+      "architecture": "SCMP_ARCH_AARCH64",
+      "subArchitectures": ["SCMP_ARCH_ARM"]
+    }
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "ptrace",
+        "mount",
+        "umount2",
+        "pivot_root",
+        "reboot",
+        "kexec_load",
+        "kexec_file_load",
+        "init_module",
+        "finit_module",
+        "delete_module",
+        "bpf",
+        "perf_event_open",
+        "acct",
+        "swapon",
+        "swapoff",
+        "clock_settime",
+        "settimeofday",
+        "add_key",
+        "request_key",
+        "keyctl",
+        "mknod",
+        "mknodat"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    }
+  ]
+}

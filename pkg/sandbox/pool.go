@@ -116,6 +116,17 @@ func NewPool(ctx context.Context, o Opts, cfg PoolConfig) (*Pool, error) {
 		reaperDone: make(chan struct{}),
 	}
 
+	// Establish the reaper lifecycle BEFORE creating holders. A holder
+	// creation failure below calls p.Close, which waits on reaperDone;
+	// setting this up first guarantees reaperDone is always in a valid
+	// terminal state (owned by a running reaper, or already closed) so
+	// Close never deadlocks on the early-failure path.
+	if cfg.IdleTimeout > 0 {
+		go p.reaper()
+	} else {
+		close(p.reaperDone) // no reaper goroutine; Close won't block on it
+	}
+
 	for i := 0; i < cfg.Min; i++ {
 		h, err := p.createHolder(ctx)
 		if err != nil {
@@ -123,12 +134,6 @@ func NewPool(ctx context.Context, o Opts, cfg PoolConfig) (*Pool, error) {
 			return nil, fmt.Errorf("pool: creating min holder %d/%d: %w", i+1, cfg.Min, err)
 		}
 		p.idle <- h
-	}
-
-	if cfg.IdleTimeout > 0 {
-		go p.reaper()
-	} else {
-		close(p.reaperDone) // no reaper goroutine; Close won't block on it
 	}
 
 	return p, nil
