@@ -387,6 +387,10 @@ Read these before pointing the k8s backend at hostile code.
   hostile-kernel-exploit threat models use a stronger boundary via
   `-runtime` (gVisor's userspace kernel, or Kata's real VM kernel).
 
+## AI Usage
+
+- This was created using a combination of Online Claude Code and offline [gemma-4-12B](https://huggingface.co/google/gemma-4-12B)
+
 ## Development
 
 ```sh
