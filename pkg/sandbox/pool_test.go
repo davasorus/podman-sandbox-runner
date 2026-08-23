@@ -117,6 +117,7 @@ func TestPoolBackgroundProcessReaped(t *testing.T) {
 }
 
 func TestPoolTimeoutLeavesPoolUsable(t *testing.T) {
+	requireDocker(t)
 	o := baseOpts()
 	o.Cmd = nil
 	o.Timeout = 3 * time.Second
@@ -242,6 +243,7 @@ func TestK8sPoolBackgroundProcessReaped(t *testing.T) {
 }
 
 func TestPoolConcurrentThroughput(t *testing.T) {
+	requireDocker(t)
 	o := baseOpts()
 	o.Cmd = nil
 	o.Timeout = 30 * time.Second
@@ -290,6 +292,7 @@ func TestPoolConcurrentThroughput(t *testing.T) {
 }
 
 func TestPoolConcurrentIsolation(t *testing.T) {
+	requireDocker(t)
 	o := baseOpts()
 	o.Cmd = nil
 	p, err := NewPool(context.Background(), o, PoolConfig{Min: 2, Max: 2})
@@ -338,6 +341,7 @@ func (p *Pool) liveCount() int {
 }
 
 func TestPoolIdleReaperShrinksToMin(t *testing.T) {
+	requireDocker(t)
 	o := baseOpts()
 	o.Cmd = nil
 	p, err := NewPool(context.Background(), o, PoolConfig{Min: 1, Max: 3, IdleTimeout: 2 * time.Second})
@@ -369,6 +373,7 @@ func TestPoolIdleReaperShrinksToMin(t *testing.T) {
 }
 
 func TestPoolScaleToZeroThenRun(t *testing.T) {
+	requireDocker(t)
 	o := baseOpts()
 	o.Cmd = nil
 	p, err := NewPool(context.Background(), o, PoolConfig{Min: 0, Max: 2, IdleTimeout: 2 * time.Second})
@@ -403,6 +408,7 @@ func TestPoolScaleToZeroThenRun(t *testing.T) {
 }
 
 func TestPoolNeverExceedsMax(t *testing.T) {
+	requireDocker(t)
 	o := baseOpts()
 	o.Cmd = nil
 	const max = 2
