@@ -10,6 +10,23 @@ echo 'print(21 * 2)' | sandbox run -json -i -image docker.io/library/python:3-al
 {"exit_code":0,"stdout":"42\n","stderr":"","duration_ms":278,"oom_killed":false,"timed_out":false}
 ```
 
+## Install
+
+```sh
+go install github.com/davasorus/podman-sandbox-runner/cmd/sandbox@latest
+```
+
+This drops a `sandbox` binary on your `PATH` (`$(go env GOPATH)/bin` — make sure
+that's on your `PATH`). Verify with `sandbox version`.
+
+You also need a container backend reachable: **docker** or **podman** (the
+default backend), or a Kubernetes context for `-backend k8s`. The `sandbox`
+binary shells out to whichever you select; it does not bundle a runtime.
+
+Prebuilt binaries and container images are also published on the
+[releases page](https://github.com/davasorus/podman-sandbox-runner/releases)
+and GHCR (`ghcr.io/davasorus/podman-sandbox-runner`).
+
 ## Backends
 
 |                   | `docker` (default)                                       | `k8s`                                                           |
