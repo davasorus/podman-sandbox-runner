@@ -1,0 +1,56 @@
+name: prepare-release
+
+# Run manually (Actions tab -> prepare-release -> Run workflow) with the
+# version to release (no leading v, e.g. 0.8.0). It validates the version,
+# checks the tag doesn't already exist, then creates and pushes the tag on the
+# current tip of `live`. The tag push triggers the existing `release` workflow
+# (GoReleaser).
+#
+# There is NO version-file bump step: the version comes entirely from the git
+# tag (GoReleaser injects it via -ldflags "-X main.version={{.Version}}"), so
+# the tag is the single source of truth and there is nothing else to keep in
+# sync.
+#
+# Requires a repo secret RELEASE_PAT (contents: read/write on this repo) so the
+# push authenticates as a real account rather than github-actions[bot] — needed
+# if the `live` branch is protected and only bypasses admins/specific users,
+# not the default GITHUB_TOKEN identity.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, no leading v (e.g. 0.8.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: live
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: validate version
+        run: |
+          set -euo pipefail
+          v="${{ inputs.version }}"
+          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not semver: $v" >&2; exit 1; }
+          tag="v${v}"
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "tag $tag already exists" >&2
+            exit 1
+          fi
+
+      - name: create and push tag
+        run: |
+          set -euo pipefail
+          tag="v${{ inputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "Release ${tag}"
+          git push origin "$tag"
