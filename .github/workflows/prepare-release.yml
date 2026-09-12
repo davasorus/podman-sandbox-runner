@@ -1,32 +1,108 @@
 name: prepare-release
 
-# Run manually (Actions tab -> prepare-release -> Run workflow) with the
-# version to release (no leading v, e.g. 0.8.0). It validates the version,
-# checks the tag doesn't already exist, then creates and pushes the tag on the
-# current tip of `live`. The tag push triggers the existing `release` workflow
-# (GoReleaser).
+# STANDARD release-tagging workflow (shared shape across davasorus repos:
+# computah, engram, gitmate, podman-sandbox-runner). Runs automatically on
+# every push to `live`, and can also run manually (Actions tab ->
+# prepare-release -> Run workflow) to force a specific version.
 #
-# There is NO version-file bump step: the version comes entirely from the git
-# tag (GoReleaser injects it via -ldflags "-X main.version={{.Version}}"), so
-# the tag is the single source of truth and there is nothing else to keep in
-# sync.
+# In automatic mode, svu (github.com/caarlos0/svu) inspects Conventional
+# Commits since the last tag to decide whether a release is warranted and,
+# if so, the next version: feat -> minor, fix -> patch, "!"/BREAKING CHANGE
+# -> major, anything else -> no bump. If there is nothing release-worthy,
+# the workflow exits quietly (see the `propose` job).
 #
-# Requires a repo secret RELEASE_PAT (contents: read/write on this repo) so the
-# push authenticates as a real account rather than github-actions[bot] — needed
-# if the `live` branch is protected and only bypasses admins/specific users,
+# Before the tag is created, the `gate` job requires manual approval via the
+# `release` GitHub Environment. Nothing is pushed until a human reviews the
+# proposed version and approves.
+#
+# svu only DECIDES the version here. Once the tag is pushed, the repo's
+# `release` workflow (GoReleaser) builds artifacts and writes GitHub Release
+# notes, grouping the same Conventional Commits into sections (Features,
+# Bug fixes, ...). There is no version-file bump step: the version comes
+# entirely from the git tag (GoReleaser injects it via
+# -ldflags "-X main.version={{.Version}}"), so the tag stays the single
+# source of truth.
+#
+# Requires a repo secret RELEASE_PAT (contents: read/write on this repo) so
+# the push authenticates as a real account rather than github-actions[bot]
+# — needed if `live` is protected and only bypasses admins/specific users,
 # not the default GITHUB_TOKEN identity.
 on:
+  push:
+    branches: [live]
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release, no leading v (e.g. 0.8.0)"
-        required: true
+        description: "Version override, no leading v (e.g. 0.8.0). Leave blank to auto-compute from Conventional Commits."
+        required: false
 
 permissions:
   contents: write
 
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
 jobs:
+  # ---- PROPOSE: compute the next tag. Creates nothing. ----
+  propose:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.next.outputs.skip }}
+      tag: ${{ steps.next.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: live
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        if: ${{ inputs.version == '' }}
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: install svu
+        if: ${{ inputs.version == '' }}
+        run: go install github.com/caarlos0/svu/v3@latest
+
+      - name: compute next version
+        id: next
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ inputs.version }}" ]]; then
+            v="${{ inputs.version }}"
+            [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not semver: $v" >&2; exit 1; }
+            tag="v${v}"
+          else
+            current="$(svu current)"
+            tag="$(svu next)"
+            if [[ "$tag" == "$current" ]]; then
+              echo "no release-worthy commits since ${current} — nothing to do"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "tag $tag already exists" >&2
+            exit 1
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "### Proposed release: ${tag}" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---- GATE: a human reviews the proposal above and approves. Nothing tagged yet. ----
+  gate:
+    needs: propose
+    if: ${{ needs.propose.outputs.skip == 'false' }}
+    runs-on: ubuntu-latest
+    environment: release # required reviewer here -> pauses for approval
+    steps:
+      - run: echo "Approved. Proceeding to tag ${{ needs.propose.outputs.tag }}."
+
+  # ---- TAG: only after approval. Pushing the tag triggers the `release` workflow. ----
   tag:
+    needs: [propose, gate]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -35,22 +111,12 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PAT }}
 
-      - name: validate version
-        run: |
-          set -euo pipefail
-          v="${{ inputs.version }}"
-          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not semver: $v" >&2; exit 1; }
-          tag="v${v}"
-          if git rev-parse "$tag" >/dev/null 2>&1; then
-            echo "tag $tag already exists" >&2
-            exit 1
-          fi
-
       - name: create and push tag
         run: |
           set -euo pipefail
-          tag="v${{ inputs.version }}"
+          tag="${{ needs.propose.outputs.tag }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -a "$tag" -m "Release ${tag}"
           git push origin "$tag"
+          echo "### Released ${tag}" >> "$GITHUB_STEP_SUMMARY"
